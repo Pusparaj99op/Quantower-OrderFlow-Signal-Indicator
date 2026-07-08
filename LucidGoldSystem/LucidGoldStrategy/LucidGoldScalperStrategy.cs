@@ -51,7 +51,7 @@ namespace LucidGold.Strategy
         [InputParameter("Symbol (MGC or GC)", 10)]
         public Symbol? TradingSymbol { get; set; }
 
-        [InputParameter("Account Name Filter", 11, "Lucid")]
+        [InputParameter("Account Name Filter", 11)]
         public string AccountNameFilter { get; set; } = "Lucid";
 
         // ── Group: Risk ───────────────────────────────────────────────
@@ -61,7 +61,7 @@ namespace LucidGold.Strategy
         [InputParameter("Min Profit Target Ticks", 21, 1, 100, 500, 5)]
         public int MinProfitTargetTicks { get; set; } = 100;
 
-        [InputParameter("Min Reward/Risk Ratio", 22, 0.1, 2.0, 10.0, 0.1)]
+        [InputParameter("Min Reward/Risk Ratio", 22, 0.1, 2.0, 10.0, 1)]
         public double MinRRRatio { get; set; } = 2.0;
 
         [InputParameter("Max Contracts", 23, 1, 1, 10, 1)]
@@ -110,10 +110,10 @@ namespace LucidGold.Strategy
         public bool EnableAfternoon { get; set; } = false;
 
         // ── Group: Filters ────────────────────────────────────────────
-        [InputParameter("Min ATR (ticks, 20-period)", 60, 0.1, 8.0, 200.0, 0.5)]
+        [InputParameter("Min ATR (ticks, 20-period)", 60, 0.1, 8.0, 200.0, 1)]
         public double MinATR { get; set; } = 8.0;
 
-        [InputParameter("Max ATR (ticks, 20-period)", 61, 1.0, 80.0, 500.0, 1.0)]
+        [InputParameter("Max ATR (ticks, 20-period)", 61, 1.0, 80.0, 500.0, 1)]
         public double MaxATR { get; set; } = 80.0;
 
         [InputParameter("Max Daily Trades", 62, 1, 3, 20, 1)]
@@ -126,10 +126,10 @@ namespace LucidGold.Strategy
         public int LargeLotGC { get; set; } = 10;
 
         // ── Group: Config Paths ───────────────────────────────────────
-        [InputParameter("Lucid Rules JSON Path", 70, "C:\\Quantower\\Config\\lucid_rules.json")]
+        [InputParameter("Lucid Rules JSON Path", 70)]
         public string LucidRulesPath { get; set; } = @"C:\Quantower\Config\lucid_rules.json";
 
-        [InputParameter("News Events CSV Path", 71, "C:\\Quantower\\Config\\news_events.csv")]
+        [InputParameter("News Events CSV Path", 71)]
         public string NewsEventsPath { get; set; } = @"C:\Quantower\Config\news_events.csv";
 
         // ── Group: Debug ──────────────────────────────────────────────
@@ -286,9 +286,8 @@ namespace LucidGold.Strategy
             }
 
             // Subscribe to all market data events
-            TradingSymbol.NewTrade    += Symbol_NewTrade;
+            TradingSymbol.NewLast     += Symbol_NewLast;
             TradingSymbol.NewLevel2   += Symbol_NewLevel2;
-            TradingSymbol.NewBar      += Symbol_NewBar;
             TradingSymbol.NewQuote    += Symbol_NewQuote;
 
             // Verify contract expiration
@@ -311,9 +310,8 @@ namespace LucidGold.Strategy
             // Unsubscribe all events
             if (TradingSymbol != null)
             {
-                TradingSymbol.NewTrade  -= Symbol_NewTrade;
+                TradingSymbol.NewLast   -= Symbol_NewLast;
                 TradingSymbol.NewLevel2 -= Symbol_NewLevel2;
-                TradingSymbol.NewBar    -= Symbol_NewBar;
                 TradingSymbol.NewQuote  -= Symbol_NewQuote;
             }
 
@@ -331,32 +329,32 @@ namespace LucidGold.Strategy
         }
 
         // ═════════════════════════════════════════════════════════════
-        // EVENT — OnNewTrade (HOT PATH — must return in < 1 ms)
+        // EVENT — NewLast (HOT PATH — must return in < 1 ms)
         // ═════════════════════════════════════════════════════════════
 
-        private void Symbol_NewTrade(Symbol sym, Trade trade)
+        private void Symbol_NewLast(Symbol sym, Last last)
         {
-            var side = trade.Aggressor == AggressorFlag.Buy  ? LocalAggressorSide.Buy
-                     : trade.Aggressor == AggressorFlag.Sell ? LocalAggressorSide.Sell
+            var side = last.AggressorFlag == AggressorFlag.Buy  ? LocalAggressorSide.Buy
+                     : last.AggressorFlag == AggressorFlag.Sell ? LocalAggressorSide.Sell
                      : LocalAggressorSide.Unknown;
 
             // Lock-free engine updates (< 1 µs each)
-            _deltaEngine.ProcessTrade(trade.Price, (long)trade.Size, side);
-            _fpEngine.ProcessTrade(trade.Price, (long)trade.Size, side);
-            _tapeEngine.ProcessTrade(trade.Price, (long)trade.Size, side, trade.Time, _largeLotThreshold);
-            _vpEngine.ProcessTrade(trade.Price, (long)trade.Size);
+            _deltaEngine.ProcessTrade(last.Price, (long)last.Size, side);
+            _fpEngine.ProcessTrade(last.Price, (long)last.Size, side);
+            _tapeEngine.ProcessTrade(last.Price, (long)last.Size, side, last.Time, _largeLotThreshold);
+            _vpEngine.ProcessTrade(last.Price, (long)last.Size);
 
             if (LogTickData)
-                QueueLog($"[TICK] {trade.Price:F1} x{trade.Size} {side}", StrategyLoggingLevel.Debug);
+                QueueLog($"[TICK] {last.Price:F1} x{last.Size} {side}", StrategyLoggingLevel.Info);
         }
 
         // ═════════════════════════════════════════════════════════════
-        // EVENT — OnNewLevel2 (DOM)
+        // EVENT — NewLevel2 (DOM)
         // ═════════════════════════════════════════════════════════════
 
-        private void Symbol_NewLevel2(Symbol sym, Level2Quote quote)
+        private void Symbol_NewLevel2(Symbol sym, Level2Quote quote, DOMQuote dom)
         {
-            var side    = quote.Type == Level2Type.Bid ? QuoteSide.Bid : QuoteSide.Ask;
+            var side    = quote.PriceType == QuotePriceType.Bid ? QuoteSide.Bid : QuoteSide.Ask;
             var domQuote = new DomLevel2Quote(quote.Price, (long)quote.Size, side, quote.Time);
             _domEngine.ProcessLevel2(domQuote);
 
@@ -365,13 +363,59 @@ namespace LucidGold.Strategy
         }
 
         // ═════════════════════════════════════════════════════════════
-        // EVENT — OnNewBar
+        // BAR PROCESSING — Triggered from OnUpdate in quote handler
         // ═════════════════════════════════════════════════════════════
 
-        private void Symbol_NewBar(Symbol sym, Period period, HistoryItemBar bar)
+        /// <summary>
+        /// Bar processing is driven from the quote handler by detecting
+        /// new bar transitions. Symbol.NewBar does not exist in this SDK.
+        /// </summary>
+        private void TriggerBarProcess(Symbol sym)
         {
             // Dispatch to background so event thread returns in < 1 ms
-            Task.Run(() => ProcessBarAsync(sym, period, bar));
+            Task.Run(() => ProcessBarFromQuoteAsync(sym));
+        }
+
+        private DateTime _lastBarProcessTime = DateTime.MinValue;
+
+        private async void ProcessBarFromQuoteAsync(Symbol sym)
+        {
+            try
+            {
+                // Throttle: only process once per 5 seconds
+                if ((DateTime.UtcNow - _lastBarProcessTime).TotalSeconds < 5) return;
+                _lastBarProcessTime = DateTime.UtcNow;
+
+                // Fetch the latest 5M bar data
+                var bars5M = await FetchBarsAsync(sym.Name, Period.MIN5, 5);
+                var barList = bars5M.ToList();
+                if (barList.Count >= 3)
+                {
+                    var coreBar = barList[^1];
+                    _msEngine5M.ProcessNewBar(coreBar, "5M");
+                    _fvgEngine.ProcessNewBar(barList[^3], barList[^2], coreBar, "5M");
+                    _fpEngine.OnBarClose(coreBar.High, coreBar.Low, coreBar.Close, coreBar.Time);
+                    _deltaEngine.OnBarClose(coreBar.High, coreBar.Low);
+                }
+
+                // 15M structure
+                var bars15M = await FetchBarsAsync(sym.Name, Period.MIN15, 3);
+                var barList15 = bars15M.ToList();
+                if (barList15.Count > 0)
+                    _msEngine15M.ProcessNewBar(barList15[^1], "15M");
+
+                _domEngine.EvaluateConditions();
+                _vpEngine.CheckSessionReset(DateTime.UtcNow);
+
+                CheckDailySessionReset();
+
+                // Periodic HTF bias refresh
+                _ = Task.Run(async () => await RefreshHTFBiasAsync(sym.Name));
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[ERROR] ProcessBarFromQuoteAsync: {ex.Message}", StrategyLoggingLevel.Error);
+            }
         }
 
         private void ProcessBarAsync(Symbol sym, Period period, HistoryItemBar bar)
@@ -939,6 +983,11 @@ namespace LucidGold.Strategy
             _entryOrder    = result.Order;
             _entryQuantity = qty;
             _orderPlacedTime = DateTime.UtcNow;
+
+            // Subscribe to order update events
+            if (_entryOrder != null)
+                _entryOrder.Updated += OnOrderUpdated;
+
             TransitionState(TradeState.OrderPending, $"Entry order placed @ {entryPrice:F1}");
 
             // Place stop loss order simultaneously
@@ -958,6 +1007,10 @@ namespace LucidGold.Strategy
             var slResult = await Core.Instance.PlaceOrderAsync(slRequest);
             _stopOrder = slResult.Status == TradingOperationResultStatus.Success
                 ? slResult.Order : null;
+
+            // Subscribe to stop order update events
+            if (_stopOrder != null)
+                _stopOrder.Updated += OnOrderUpdated;
 
             if (_stopOrder == null)
                 QueueLog("[ORDER] WARNING: Stop loss order failed to place! Monitor manually.",
@@ -1039,7 +1092,7 @@ namespace LucidGold.Strategy
             var workingOrders = Core.Instance.Orders
                 .Where(o => o.Account?.Name.Contains(AccountNameFilter,
                                 StringComparison.OrdinalIgnoreCase) == true &&
-                            o.Status == OrderStatus.Working)
+                            o.Status == OrderStatus.Opened)
                 .ToList();
 
             foreach (var order in workingOrders)
@@ -1064,13 +1117,15 @@ namespace LucidGold.Strategy
         // ORDER & POSITION EVENT HANDLERS
         // ═════════════════════════════════════════════════════════════
 
-        protected override void OnOrderChanged(Order order)
+        /// <summary>
+        /// Called when an Order we are tracking gets updated.
+        /// Subscribed via Order.Updated += OnOrderUpdated in order placement code.
+        /// </summary>
+        private void OnOrderUpdated(Order order)
         {
-            base.OnOrderChanged(order);
-
             if (order.Status == OrderStatus.Filled && order == _entryOrder)
             {
-                _actualEntryPrice = order.AverageFilledPrice;
+                _actualEntryPrice = order.AverageFillPrice;
                 _entryFilledTime  = DateTime.UtcNow;
                 _breakevenMoved   = false;
                 _tp1Hit           = false;
@@ -1078,7 +1133,7 @@ namespace LucidGold.Strategy
                 _dailyTradeCount++;
 
                 // Verify stop loss is working
-                if (_stopOrder?.Status != OrderStatus.Working)
+                if (_stopOrder?.Status != OrderStatus.Opened)
                 {
                     QueueLog("[RISK] CRITICAL: Stop loss order NOT working after fill! " +
                              "Manual intervention required.", StrategyLoggingLevel.Error);
@@ -1098,7 +1153,7 @@ namespace LucidGold.Strategy
             }
             else if (order.Status == OrderStatus.Filled && order == _stopOrder)
             {
-                double exitPrice = order.AverageFilledPrice;
+                double exitPrice = order.AverageFillPrice;
                 double ticks = _setupDirection == SignalDirection.Long
                     ? (_actualEntryPrice - exitPrice) / _tickSize
                     : (exitPrice - _actualEntryPrice) / _tickSize;
@@ -1109,24 +1164,27 @@ namespace LucidGold.Strategy
                 _activeSignal = null;
                 TransitionState(TradeState.Flat, "Stop loss filled");
             }
-            else if (order.Status == OrderStatus.Rejected)
+            else if (order.Status == OrderStatus.Refused)
             {
-                QueueLog($"[ORDER] Rejected: {order.Comment} | Reason: {order.LastUpdateMessage}",
+                QueueLog($"[ORDER] Refused: {order.Comment}",
                          StrategyLoggingLevel.Error);
             }
         }
 
-        protected override void OnPositionChanged(Position position)
+        /// <summary>
+        /// Called when a Position we are tracking gets updated.
+        /// Subscribed via Position.Updated += OnPositionUpdated when position opens.
+        /// </summary>
+        private void OnPositionUpdated(Position position)
         {
-            base.OnPositionChanged(position);
             if (TradingSymbol == null || position.Symbol != TradingSymbol) return;
 
-            _sessionUnrealizedPnL = position.GrossPnl;
+            _sessionUnrealizedPnL = position.GrossPnL.Value;
 
             if (position.Quantity == 0 && _state == TradeState.InTrade)
             {
                 // Position fully closed
-                _sessionRealizedPnL += position.GrossPnl;
+                _sessionRealizedPnL += position.GrossPnL.Value;
                 TransitionState(TradeState.Flat, "Position fully closed");
                 _activeSignal = null;
                 _stopOrder    = null;
