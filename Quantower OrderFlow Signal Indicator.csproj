@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
@@ -24,7 +24,13 @@
   <ItemGroup>
     <Compile Remove="LucidGoldFlowScalper\**" />
     <Compile Remove="Reflector\**" />
+    <Compile Remove="LucidGoldSystem\**" />
+    <Compile Remove="LucidGoldCore\**" />
+    <Compile Remove="Config\**" />
     <None Remove="LucidGoldFlowScalper\**" />
     <None Remove="Reflector\**" />
+    <None Remove="LucidGoldSystem\**" />
+    <None Remove="LucidGoldCore\**" />
+    <None Remove="Config\**" />
   </ItemGroup>
 </Project>
