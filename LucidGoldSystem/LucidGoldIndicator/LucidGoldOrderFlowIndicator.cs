@@ -173,6 +173,13 @@ namespace LucidGold.Indicator
 
             _barDeltaSeriesIdx = 0;
             _cumDeltaSeriesIdx = 1;
+
+            // Subscribe to real-time data events (Indicator has no OnNewTrade/OnNewLevel2 overrides)
+            if (Symbol != null)
+            {
+                Symbol.NewLast   += HandleNewLast;
+                Symbol.NewLevel2 += HandleNewLevel2;
+            }
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -265,29 +272,25 @@ namespace LucidGold.Indicator
         }
 
         // ─────────────────────────────────────────────────────────────
-        // OnNewTrade — fed from platform via event (if subscribed)
+        // NewLast / NewLevel2 — Subscribe via Symbol events in OnInit
+        // (No overrides exist on Indicator base class in this SDK)
         // ─────────────────────────────────────────────────────────────
 
-        protected override void OnNewTrade(string symbol, DateTime time, double price,
-                                           long size, AggressorFlag aggressorFlag)
+        private void HandleNewLast(Symbol symbol, Last last)
         {
-            var side = aggressorFlag == AggressorFlag.Buy  ? AggressorSide.Buy
-                     : aggressorFlag == AggressorFlag.Sell ? AggressorSide.Sell
+            var side = last.AggressorFlag == AggressorFlag.Buy  ? AggressorSide.Buy
+                     : last.AggressorFlag == AggressorFlag.Sell ? AggressorSide.Sell
                      : AggressorSide.Unknown;
 
-            _deltaEngine.ProcessTrade(price, size, side);
-            _fpEngine.ProcessTrade(price, size, side);
-            _tapeEngine.ProcessTrade(price, size, side, time, _largeLotThreshold);
-            _vpEngine.ProcessTrade(price, size);
+            _deltaEngine.ProcessTrade(last.Price, (long)last.Size, side);
+            _fpEngine.ProcessTrade(last.Price, (long)last.Size, side);
+            _tapeEngine.ProcessTrade(last.Price, (long)last.Size, side, last.Time, _largeLotThreshold);
+            _vpEngine.ProcessTrade(last.Price, (long)last.Size);
         }
 
-        // ─────────────────────────────────────────────────────────────
-        // OnNewLevel2 — fed from platform
-        // ─────────────────────────────────────────────────────────────
-
-        protected override void OnNewLevel2(string symbol, Level2Quote quote)
+        private void HandleNewLevel2(Symbol symbol, Level2Quote quote, DOMQuote dom)
         {
-            var side = quote.Type == Level2Type.Bid ? QuoteSide.Bid : QuoteSide.Ask;
+            var side = quote.PriceType == QuotePriceType.Bid ? QuoteSide.Bid : QuoteSide.Ask;
             var domQuote = new DomLevel2Quote(quote.Price, (long)quote.Size, side, quote.Time);
             _domEngine.ProcessLevel2(domQuote);
 
@@ -378,7 +381,7 @@ namespace LucidGold.Indicator
         // OnPaintChart — all visual rendering
         // ─────────────────────────────────────────────────────────────
 
-        protected override void OnPaintChart(PaintChartEventArgs args)
+        public override void OnPaintChart(PaintChartEventArgs args)
         {
             var gr      = args.Graphics;
             var bounds  = args.Rectangle;
