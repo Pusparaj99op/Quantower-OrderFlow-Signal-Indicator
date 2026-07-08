@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
 using TradingPlatform.BusinessLayer;
+using TradingPlatform.BusinessLayer.Integration;  // for QuotePriceType used in Level2Quote.PriceType
 using LucidGold.Core.Engines;
 using LucidGold.Core.Enums;
 using LucidGold.Core.Models;
@@ -162,7 +163,9 @@ namespace LucidGold.Indicator
             _msEngine15M = new MarketStructureEngine();
             _fvgEngine   = new FVGEngine(_tickSize);
             _obEngine    = new OrderBlockEngine(_tickSize);
-            _htfEngine   = new HTFBiasEngine(msg => Log(msg, StrategyLoggingLevel.Info));
+            // NOTE: Indicator class does not have a Log() method (that's Strategy-only).
+            // HTFBiasEngine accepts a log Action<string>; pass a no-op for the indicator.
+            _htfEngine   = new HTFBiasEngine(_ => { });
             _kzEngine    = new KillZoneEngine();
             _deltaEngine = new CumulativeDeltaEngine();
             _fpEngine    = new FootprintEngine(_tickSize);
@@ -216,23 +219,25 @@ namespace LucidGold.Indicator
 
         private void ProcessBarClose(UpdateArgs args)
         {
-            if (HistoricalData.Count < 3) return;
+            // BUG 5 FIX: HistoricalData[0] = current forming bar (skip it).
+            // HistoricalData[1] = bar that JUST CLOSED — this is what we process.
+            if (HistoricalData.Count < 4) return;
 
-            var bar0 = ToBar(HistoricalData[0]);  // newest (just closed)
-            var bar1 = ToBar(HistoricalData[1]);
-            var bar2 = HistoricalData.Count > 2 ? ToBar(HistoricalData[2]) : bar1;
+            var bar0 = ToBar(HistoricalData[1]);  // just closed
+            var bar1 = ToBar(HistoricalData[2]);
+            var bar2 = HistoricalData.Count > 3 ? ToBar(HistoricalData[3]) : bar1;
 
             string tf = HistoricalData.Aggregation?.ToString() ?? "1M";
 
-            _msEngine5M.ProcessNewBar(bar1, tf);
-            _fvgEngine.ProcessNewBar(bar2, bar1, bar0, tf);
+            _msEngine5M.ProcessNewBar(bar0, tf);
+            _fvgEngine.ProcessNewBar(bar2, bar1, bar0, tf);   // c1=oldest, c2=middle, c3=newest
             _fpEngine.OnBarClose(bar0.High, bar0.Low, bar0.Close, bar0.Time);
             _deltaEngine.OnBarClose(bar0.High, bar0.Low);
 
-            // Build bar list for OB detection (last 30 bars)
+            // Build bar list for OB detection (last 30 closed bars; skip index 0 = forming bar)
             var barList = new List<CoreBar>();
-            int count = Math.Min(30, HistoricalData.Count);
-            for (int i = count - 1; i >= 0; i--)
+            int count = Math.Min(30, HistoricalData.Count - 1);  // skip index 0 (forming bar)
+            for (int i = count; i >= 1; i--)
                 barList.Add(ToBar(HistoricalData[i]));
             _obEngine.ProcessBars(barList, _msEngine5M.GetATR20(), _tickSize);
 
@@ -309,12 +314,15 @@ namespace LucidGold.Indicator
                            EnableLondonTint, EnableNYTint, false, false);
             bool isSB = _kzEngine.IsSilverBullet(DateTime.UtcNow);
 
-            var fvgL = _fvgEngine.GetNearestFVG(
-                HistoricalData[0][PriceType.Close], SignalDirection.Long);
-            var fvgS = _fvgEngine.GetNearestFVG(
-                HistoricalData[0][PriceType.Close], SignalDirection.Short);
+            // BUG 5 FIX: Use last CLOSED bar price (index 1), not forming bar (index 0)
+            double currentPrice = HistoricalData.Count > 1
+                ? HistoricalData[1][PriceType.Close]
+                : HistoricalData[0][PriceType.Close];
+
+            var fvgL = _fvgEngine.GetNearestFVG(currentPrice, SignalDirection.Long);
+            var fvgS = _fvgEngine.GetNearestFVG(currentPrice, SignalDirection.Short);
             var ob   = _obEngine.GetNearestOrderBlock(
-                HistoricalData[0][PriceType.Close],
+                currentPrice,
                 ms?.Direction ?? SignalDirection.Long);
 
             var fpSig = _fpEngine.GetSignalSummary();
@@ -440,7 +448,10 @@ namespace LucidGold.Indicator
                 try
                 {
                     var barTime = HistoricalData[i].TimeLeft;
-                    var kz = _kzEngine.GetActiveKillZoneName(barTime.ToUniversalTime(),
+                    // BUG 6 FIX: TimeLeft is already UTC; SpecifyKind prevents double-conversion
+                    // when DateTimeKind is Unspecified (would incorrectly shift by local timezone offset)
+                    var barTimeUtc = DateTime.SpecifyKind(barTime, DateTimeKind.Utc);
+                    var kz = _kzEngine.GetActiveKillZoneName(barTimeUtc,
                                  EnableLondonTint, EnableNYTint, false, false);
                     if (kz == "None") continue;
 
@@ -830,31 +841,58 @@ namespace LucidGold.Indicator
         private static readonly TimeZoneInfo EasternTime =
             TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
-        // Quantower coordinate helpers — these are implemented by the base class
-        // via protected abstract/virtual methods. We use them via reflection pattern.
-        // In real SDK: GetXByBarNumber, GetXByTime, GetYByValue are available.
+        // ─────────────────────────────────────────────────────────────
+        // Quantower coordinate helpers — verified against SDK v1.146.14
+        // IChartWindowCoordinatesConverter: GetChartX(DateTime), GetChartY(double)
+        // IChart.BarsWidth: bar pixel width
+        // ─────────────────────────────────────────────────────────────
 
-        private float GetXByBarNumber(int barNumber)
+        // BUG 2 FIX: Was using non-existent base.ChartWindow?.GetXByBarNumber/etc.
+        // Correct API: CurrentChart.MainWindow.CoordinatesConverter.GetChartX/GetChartY
+
+        private float GetXByBarNumber(int barIndex)
         {
-            try { return base.ChartWindow?.GetXByBarNumber(barNumber) ?? 0f; }
+            try
+            {
+                var chart = this.CurrentChart;
+                if (chart == null) return 0f;
+                // Convert bar index to timestamp, then to screen X
+                var item = HistoricalData[barIndex];
+                return (float)chart.MainWindow.CoordinatesConverter.GetChartX(item.TimeLeft);
+            }
             catch { return 0f; }
         }
 
         private float GetXByTime(DateTime time)
         {
-            try { return base.ChartWindow?.GetXByTime(time) ?? 0f; }
+            try
+            {
+                var chart = this.CurrentChart;
+                if (chart == null) return 0f;
+                return (float)chart.MainWindow.CoordinatesConverter.GetChartX(time);
+            }
             catch { return 0f; }
         }
 
         private float GetYByValue(double price)
         {
-            try { return base.ChartWindow?.GetYByValue(price) ?? 0f; }
+            try
+            {
+                var chart = this.CurrentChart;
+                if (chart == null) return 0f;
+                return (float)chart.MainWindow.CoordinatesConverter.GetChartY(price);
+            }
             catch { return 0f; }
         }
 
         private float GetBarWidth()
         {
-            try { return base.ChartWindow?.GetBarWidth() ?? 4f; }
+            try
+            {
+                var chart = this.CurrentChart;
+                if (chart == null) return 4f;
+                return (float)chart.BarsWidth;
+            }
             catch { return 4f; }
         }
 
@@ -864,6 +902,12 @@ namespace LucidGold.Indicator
 
         protected override void OnClear()
         {
+            // BUG 3 FIX: Unsubscribe symbol events to prevent memory leak / crash on indicator reload
+            if (Symbol != null)
+            {
+                Symbol.NewLast   -= HandleNewLast;
+                Symbol.NewLevel2 -= HandleNewLevel2;
+            }
             _domEngine?.Dispose();
         }
     }
