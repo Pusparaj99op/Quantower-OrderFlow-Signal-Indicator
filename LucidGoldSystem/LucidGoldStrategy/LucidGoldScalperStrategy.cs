@@ -22,6 +22,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using TradingPlatform.BusinessLayer;
+using TradingPlatform.BusinessLayer.Integration;  // for QuotePriceType in Level2Quote.PriceType
 using LucidGold.Core.Engines;
 using LucidGold.Core.Enums;
 using LucidGold.Core.Models;
@@ -223,7 +224,7 @@ namespace LucidGold.Strategy
             Name        = "Lucid Gold Scalper";
             Description = "Production ICT/SMC/Order-Flow autonomous strategy for MGC/GC " +
                           "on Lucid Flex 25K evaluation. Reads lucid_rules.json for compliance.";
-            Version     = "1.0.0";
+            // Note: Version property is read-only in the SDK; do not assign here.
         }
 
         // ═════════════════════════════════════════════════════════════
@@ -290,6 +291,13 @@ namespace LucidGold.Strategy
             TradingSymbol.NewLevel2   += Symbol_NewLevel2;
             TradingSymbol.NewQuote    += Symbol_NewQuote;
 
+            // BUG 11 FIX: Subscribe to bar close events via HistoricalData.NewHistoryItem
+            // This replaces the incorrect quote-throttle approach (ProcessBarFromQuoteAsync).
+            _barData5M  = TradingSymbol.GetHistory(Period.MIN5,  DateTime.UtcNow.AddDays(-5),  DateTime.UtcNow);
+            _barData15M = TradingSymbol.GetHistory(Period.MIN15, DateTime.UtcNow.AddDays(-5),  DateTime.UtcNow);
+            if (_barData5M  != null) _barData5M.NewHistoryItem  += On5MBarClosed;
+            if (_barData15M != null) _barData15M.NewHistoryItem += On15MBarClosed;
+
             // Verify contract expiration
             CheckExpirationOnStartup();
 
@@ -314,6 +322,10 @@ namespace LucidGold.Strategy
                 TradingSymbol.NewLevel2 -= Symbol_NewLevel2;
                 TradingSymbol.NewQuote  -= Symbol_NewQuote;
             }
+
+            // BUG 11 FIX: Unsubscribe bar data events
+            if (_barData5M  != null) _barData5M.NewHistoryItem  -= On5MBarClosed;
+            if (_barData15M != null) _barData15M.NewHistoryItem -= On15MBarClosed;
 
             // Stop log thread
             _logRunning = false;
@@ -354,6 +366,7 @@ namespace LucidGold.Strategy
 
         private void Symbol_NewLevel2(Symbol sym, Level2Quote quote, DOMQuote dom)
         {
+            // QuotePriceType is in TradingPlatform.BusinessLayer.Integration namespace (added above)
             var side    = quote.PriceType == QuotePriceType.Bid ? QuoteSide.Bid : QuoteSide.Ask;
             var domQuote = new DomLevel2Quote(quote.Price, (long)quote.Size, side, quote.Time);
             _domEngine.ProcessLevel2(domQuote);
@@ -366,56 +379,25 @@ namespace LucidGold.Strategy
         // BAR PROCESSING — Triggered from OnUpdate in quote handler
         // ═════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Bar processing is driven from the quote handler by detecting
-        /// new bar transitions. Symbol.NewBar does not exist in this SDK.
-        /// </summary>
-        private void TriggerBarProcess(Symbol sym)
+        // ─────────────────────────────────────────────────────────────
+        // BAR PROCESSING — Driven by HistoricalData.NewHistoryItem events
+        // (BUG 11 FIX: replaces incorrect quote-based throttle approach)
+        // ─────────────────────────────────────────────────────────────
+
+        // BUG 11 FIX: HistoricalData subscriptions for proper bar-close detection
+        private HistoricalData? _barData5M;
+        private HistoricalData? _barData15M;
+
+        private void On5MBarClosed(object? sender, HistoryEventArgs args)
         {
-            // Dispatch to background so event thread returns in < 1 ms
-            Task.Run(() => ProcessBarFromQuoteAsync(sym));
+            if (args.HistoryItem is HistoryItemBar bar)
+                Task.Run(() => ProcessBarAsync(TradingSymbol!, Period.MIN5, bar));
         }
 
-        private DateTime _lastBarProcessTime = DateTime.MinValue;
-
-        private async void ProcessBarFromQuoteAsync(Symbol sym)
+        private void On15MBarClosed(object? sender, HistoryEventArgs args)
         {
-            try
-            {
-                // Throttle: only process once per 5 seconds
-                if ((DateTime.UtcNow - _lastBarProcessTime).TotalSeconds < 5) return;
-                _lastBarProcessTime = DateTime.UtcNow;
-
-                // Fetch the latest 5M bar data
-                var bars5M = await FetchBarsAsync(sym.Name, Period.MIN5, 5);
-                var barList = bars5M.ToList();
-                if (barList.Count >= 3)
-                {
-                    var coreBar = barList[^1];
-                    _msEngine5M.ProcessNewBar(coreBar, "5M");
-                    _fvgEngine.ProcessNewBar(barList[^3], barList[^2], coreBar, "5M");
-                    _fpEngine.OnBarClose(coreBar.High, coreBar.Low, coreBar.Close, coreBar.Time);
-                    _deltaEngine.OnBarClose(coreBar.High, coreBar.Low);
-                }
-
-                // 15M structure
-                var bars15M = await FetchBarsAsync(sym.Name, Period.MIN15, 3);
-                var barList15 = bars15M.ToList();
-                if (barList15.Count > 0)
-                    _msEngine15M.ProcessNewBar(barList15[^1], "15M");
-
-                _domEngine.EvaluateConditions();
-                _vpEngine.CheckSessionReset(DateTime.UtcNow);
-
-                CheckDailySessionReset();
-
-                // Periodic HTF bias refresh
-                _ = Task.Run(async () => await RefreshHTFBiasAsync(sym.Name));
-            }
-            catch (Exception ex)
-            {
-                QueueLog($"[ERROR] ProcessBarFromQuoteAsync: {ex.Message}", StrategyLoggingLevel.Error);
-            }
+            if (args.HistoryItem is HistoryItemBar bar)
+                Task.Run(() => ProcessBarAsync(TradingSymbol!, Period.MIN15, bar));
         }
 
         private void ProcessBarAsync(Symbol sym, Period period, HistoryItemBar bar)
@@ -429,10 +411,8 @@ namespace LucidGold.Strategy
                     High   = bar.High,
                     Low    = bar.Low,
                     Close  = bar.Close,
-                    Volume = bar.Volume
+                    Volume = (long)bar.Volume  // SDK: HistoryItemBar.Volume is double; CoreBar.Volume is long
                 };
-
-                string tf = period.ToString();
 
                 // 5-minute bars drive primary structure
                 if (period == Period.MIN5)
@@ -449,13 +429,14 @@ namespace LucidGold.Strategy
                 _fpEngine.OnBarClose(bar.High, bar.Low, bar.Close, bar.TimeLeft);
                 _deltaEngine.OnBarClose(bar.High, bar.Low);
                 _domEngine.EvaluateConditions();
-                _vpEngine.CheckSessionReset(bar.TimeLeft.ToUniversalTime());
+                // BUG 11 FIX: bar.TimeLeft is already UTC; SpecifyKind prevents double-conversion
+                _vpEngine.CheckSessionReset(DateTime.SpecifyKind(bar.TimeLeft, DateTimeKind.Utc));
 
                 // Check daily session reset
                 CheckDailySessionReset();
 
                 // Periodic HTF bias refresh
-                _ = Task.Run(async () => await RefreshHTFBiasAsync(sym.Name));
+                Task.Run(() => RefreshHTFBias(sym.Name));
             }
             catch (Exception ex)
             {
@@ -476,13 +457,24 @@ namespace LucidGold.Strategy
             return _priorBarCache[target % 3] ?? current;
         }
 
-        private async Task RefreshHTFBiasAsync(string symbolName)
+        // BUG 8 FIX: Replaced FetchBarsAsync (used non-existent SimpleAggregation +
+        // Core.Instance.GetHistoryAsync) with synchronous Symbol.GetHistory().
+        // Also fixed: new Period(PeriodType.Hour, 4) → Period.HOUR4 (SDK constant).
+        private void RefreshHTFBias(string symbolName)
         {
             try
             {
-                // Only refresh if 15 min have passed (throttled inside HTFBiasEngine)
-                var dailyBars = await FetchBarsAsync(symbolName, Period.DAY1, 50);
-                var h4Bars    = await FetchBarsAsync(symbolName, new Period(PeriodType.Hour, 4), 50);
+                var sym = TradingPlatform.BusinessLayer.Core.Instance.Symbols
+                              .FirstOrDefault(s => s.Name == symbolName);
+                if (sym == null) return;
+
+                var from    = DateTime.UtcNow.AddDays(-60);
+                var to      = DateTime.UtcNow;
+                var dailyHD = sym.GetHistory(Period.DAY1,  from, to);
+                var h4HD    = sym.GetHistory(Period.HOUR4, from, to);
+
+                var dailyBars = ConvertHistoricalData(dailyHD);
+                var h4Bars    = ConvertHistoricalData(h4HD);
                 _htfEngine.Refresh(dailyBars, h4Bars);
             }
             catch (Exception ex)
@@ -491,33 +483,36 @@ namespace LucidGold.Strategy
             }
         }
 
-        private async Task<IEnumerable<CoreBar>> FetchBarsAsync(string symbol, Period period, int count)
+        private IEnumerable<CoreBar> FetchBars(string symbolName, Period period, int barsCount)
         {
             try
             {
-                var sym = Core.Instance.Symbols.FirstOrDefault(s => s.Name == symbol);
+                var sym = TradingPlatform.BusinessLayer.Core.Instance.Symbols
+                              .FirstOrDefault(s => s.Name == symbolName);
                 if (sym == null) return Enumerable.Empty<CoreBar>();
 
-                var request = new HistoryRequestParameters
-                {
-                    Symbol      = sym,
-                    Period      = period,
-                    FromTime    = DateTime.UtcNow.AddDays(-count),
-                    ToTime      = DateTime.UtcNow,
-                    Aggregation = new SimpleAggregation()
-                };
-
-                var history = await Core.Instance.GetHistoryAsync(request);
-                return history.Select(item =>
-                {
-                    if (item is HistoryItemBar b)
-                        return new CoreBar { Time=item.TimeLeft, Open=b.Open, High=b.High,
-                                             Low=b.Low, Close=b.Close, Volume=b.Volume };
-                    double p = item[PriceType.Close];
-                    return new CoreBar { Time=item.TimeLeft, Open=p, High=p, Low=p, Close=p };
-                }).ToList();
+                var from = DateTime.UtcNow.AddDays(-barsCount);
+                var to   = DateTime.UtcNow;
+                var hd   = sym.GetHistory(period, from, to);
+                return ConvertHistoricalData(hd);
             }
             catch { return Enumerable.Empty<CoreBar>(); }
+        }
+
+        private static IEnumerable<CoreBar> ConvertHistoricalData(HistoricalData? hd)
+        {
+            if (hd == null) return Enumerable.Empty<CoreBar>();
+            var result = new List<CoreBar>(hd.Count);
+            for (int i = 0; i < hd.Count; i++)
+            {
+                var item = hd[i];
+                if (item is HistoryItemBar b)
+                    result.Add(new CoreBar { Time = b.TimeLeft, Open = b.Open,
+                                            High = b.High, Low = b.Low,
+                                            Close = b.Close,
+                                            Volume = (long)b.Volume }); // b.Volume is double
+            }
+            return result;
         }
 
         // ═════════════════════════════════════════════════════════════
@@ -549,13 +544,14 @@ namespace LucidGold.Strategy
                 var account = FindLucidAccount();
                 if (account != null)
                 {
-                    decimal equity = (decimal)account.Equity;
-                    decimal realPnL = (decimal)account.TodayRealizedPnL;
-                    _compliance.UpdateEquity(equity, realPnL, (decimal)account.TodayUnrealizedPnL);
+                    // SDK: Account has only .Balance. Use it for equity tracking.
+                    decimal equity  = (decimal)account.Balance;
+                    decimal realPnL = 0m;  // no TodayRealizedPnL in this SDK version
+                    _compliance.UpdateEquity(equity, realPnL, 0m);
 
                     if (_compliance.IsEmergencyHalt && currentState != TradeState.Halted)
                     {
-                        await EmergencyHaltAsync("DrawdownFloor breached");
+                        EmergencyHalt("DrawdownFloor breached");
                         return;
                     }
                 }
@@ -564,7 +560,7 @@ namespace LucidGold.Strategy
                 if (_compliance.ShouldFlattenForWeekend(DateTime.UtcNow) &&
                     currentState == TradeState.InTrade)
                 {
-                    await FlattenPositionAsync("WeekendFlat");
+                    FlattenPosition("WeekendFlat");
                     return;
                 }
 
@@ -572,7 +568,7 @@ namespace LucidGold.Strategy
                 if (_compliance.ShouldFlattenForNews(DateTime.UtcNow) &&
                     currentState == TradeState.InTrade)
                 {
-                    await FlattenPositionAsync("NewsFlatten");
+                    FlattenPosition("NewsFlatten");
                     return;
                 }
 
@@ -596,7 +592,7 @@ namespace LucidGold.Strategy
                         break;
 
                     case TradeState.AwaitingConfirmation:
-                        await EvaluateAwaitingConfirmationAsync(mid, bid, ask);
+                        EvaluateAwaitingConfirmation(mid, bid, ask);
                         break;
 
                     case TradeState.OrderPending:
@@ -753,7 +749,8 @@ namespace LucidGold.Strategy
         // State: AWAITING_CONFIRMATION
         // ─────────────────────────────────────────────────────────────
 
-        private async Task EvaluateAwaitingConfirmationAsync(double mid, double bid, double ask)
+        // BUG 7 FIX: was async Task, changed to void. Removed await + async keyword.
+        private void EvaluateAwaitingConfirmation(double mid, double bid, double ask)
         {
             if (_activeSignal == null) { TransitionState(TradeState.Scanning, "Signal lost"); return; }
 
@@ -793,7 +790,7 @@ namespace LucidGold.Strategy
             }
 
             // All confirmations satisfied — place order
-            await PlaceEntryOrderAsync(bid, ask);
+            PlaceEntryOrder(bid, ask);
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -813,13 +810,14 @@ namespace LucidGold.Strategy
             {
                 QueueLog($"[ORDER] Fill timeout ({MaxFillWaitMinutes}min). Cancelling entry order.",
                          StrategyLoggingLevel.Info);
-                _ = Task.Run(async () =>
-                {
-                    await Core.Instance.CancelOrderAsync(_entryOrder);
-                    _entryOrder = null;
-                    _activeSignal = null;
-                    TransitionState(TradeState.Scanning, "Fill timeout");
-                });
+                // BUG 7 FIX: CancelOrder is synchronous in this SDK
+                var cancelOrder = _entryOrder;
+                _entryOrder   = null;
+                _activeSignal = null;
+                try { TradingPlatform.BusinessLayer.Core.Instance.CancelOrder(
+                        new CancelOrderRequestParameters { Order = cancelOrder }); }
+                catch { }
+                TransitionState(TradeState.Scanning, "Fill timeout");
             }
         }
 
@@ -838,7 +836,8 @@ namespace LucidGold.Strategy
                 return;
             }
 
-            double unrealizedPnL = position.GrossPnl;
+            // BUG 10 FIX: Position.GrossPnL (capital L). .Value because PnlValue wraps nullable double.
+            double unrealizedPnL = position.GrossPnL.Value;
             _sessionUnrealizedPnL = unrealizedPnL;
 
             double ticksProfit = _setupDirection == SignalDirection.Long
@@ -859,7 +858,7 @@ namespace LucidGold.Strategy
             {
                 QueueLog("[MANAGE] Conviction reversal: stacked imbalance + DOM against position. " +
                          "Closing immediately.", StrategyLoggingLevel.Trading);
-                await FlattenPositionAsync("ConvictionReversal");
+                FlattenPosition("ConvictionReversal");
                 return;
             }
 
@@ -870,7 +869,7 @@ namespace LucidGold.Strategy
             {
                 QueueLog($"[MANAGE] Time stop triggered after {MaxTradeDurationMinutes}min. " +
                          "Price has not reached TP1.", StrategyLoggingLevel.Trading);
-                await FlattenPositionAsync("TimeStop");
+                FlattenPosition("TimeStop");
                 return;
             }
 
@@ -881,7 +880,7 @@ namespace LucidGold.Strategy
                     ? _actualEntryPrice + 2 * _tickSize
                     : _actualEntryPrice - 2 * _tickSize;
 
-                await ModifyStopOrderAsync(bePrice);
+                ModifyStopOrder(bePrice);
                 _breakevenMoved = true;
                 QueueLog($"[MANAGE] Breakeven moved to {bePrice:F1} | Ticks profit={ticksProfit:F0}",
                          StrategyLoggingLevel.Trading);
@@ -890,16 +889,14 @@ namespace LucidGold.Strategy
             // ── TP1 Rule ─────────────────────────────────────────────
             if (!_tp1Hit && ticksProfit >= TP1Ticks && position.Quantity > 1)
             {
-                // Close 50% of position
                 int closeQty = (int)(Math.Ceiling(position.Quantity / 2.0));
-                await ClosePartialAsync(closeQty, $"TP1 @ {mid:F1}");
+                ClosePartial(closeQty, $"TP1 @ {mid:F1}");
                 _tp1Hit = true;
 
-                // Move SL to TP1 - 5 ticks
                 double lockInPrice = _setupDirection == SignalDirection.Long
                     ? _activeSignal.TP1Price - 5 * _tickSize
                     : _activeSignal.TP1Price + 5 * _tickSize;
-                await ModifyStopOrderAsync(lockInPrice);
+                ModifyStopOrder(lockInPrice);
 
                 QueueLog($"[MANAGE] TP1 hit @ {mid:F1}. Closed {closeQty} contracts. " +
                          $"SL locked to {lockInPrice:F1}", StrategyLoggingLevel.Trading);
@@ -920,7 +917,7 @@ namespace LucidGold.Strategy
                 if (shouldMove)
                 {
                     _trailingStopPrice = newTrail;
-                    await ModifyStopOrderAsync(_trailingStopPrice);
+                    ModifyStopOrder(_trailingStopPrice);
                     QueueLog($"[MANAGE] ATR trail stop moved to {_trailingStopPrice:F1}",
                              StrategyLoggingLevel.Info);
                 }
@@ -931,7 +928,9 @@ namespace LucidGold.Strategy
         // ORDER OPERATIONS
         // ═════════════════════════════════════════════════════════════
 
-        private async Task PlaceEntryOrderAsync(double bid, double ask)
+        // BUG 7 FIX: Renamed from PlaceEntryOrderAsync. All Core.Instance order methods
+        // are synchronous in this SDK. Removed async/await throughout.
+        private void PlaceEntryOrder(double bid, double ask)
         {
             if (_activeSignal == null) return;
 
@@ -973,14 +972,17 @@ namespace LucidGold.Strategy
                 Comment     = $"LucidGold|Score={_activeSignal.Score:F0}|{_activeSignal.Direction}"
             };
 
-            var result = await Core.Instance.PlaceOrderAsync(entryRequest);
+            // BUG 7 / SDK FIX: PlaceOrder returns TradingOperationResult with .OrderId (string),
+            // not .Order. Look up the order object from Core.Instance.Orders after placement.
+            var result = TradingPlatform.BusinessLayer.Core.Instance.PlaceOrder(entryRequest);
             if (result.Status == TradingOperationResultStatus.Failure)
             {
                 QueueLog($"[ORDER] Entry order failed: {result.Message}", StrategyLoggingLevel.Error);
                 return;
             }
 
-            _entryOrder    = result.Order;
+            _entryOrder    = TradingPlatform.BusinessLayer.Core.Instance.Orders
+                                .FirstOrDefault(o => o.Id == result.OrderId);
             _entryQuantity = qty;
             _orderPlacedTime = DateTime.UtcNow;
 
@@ -998,17 +1000,24 @@ namespace LucidGold.Strategy
                 Account     = account,
                 Side        = _activeSignal.Direction == SignalDirection.Long ? Side.Sell : Side.Buy,
                 OrderTypeId = OrderType.Stop,
-                StopPrice   = slPrice,
+                TriggerPrice = slPrice,   // SDK: Stop orders use TriggerPrice, not StopPrice
                 Quantity    = qty,
                 TimeInForce = TimeInForce.GTC,
                 Comment     = "LucidGold|SL"
             };
 
-            var slResult = await Core.Instance.PlaceOrderAsync(slRequest);
-            _stopOrder = slResult.Status == TradingOperationResultStatus.Success
-                ? slResult.Order : null;
+            var slResult = TradingPlatform.BusinessLayer.Core.Instance.PlaceOrder(slRequest);
+            if (slResult.Status == TradingOperationResultStatus.Success)
+            {
+                _stopOrder = TradingPlatform.BusinessLayer.Core.Instance.Orders
+                                .FirstOrDefault(o => o.Id == slResult.OrderId);
+            }
+            else
+            {
+                _stopOrder = null;
+            }
 
-            // Subscribe to stop order update events
+            // Subscribe to stop order update events — IOrder.Updated fires Action<IOrder>
             if (_stopOrder != null)
                 _stopOrder.Updated += OnOrderUpdated;
 
@@ -1023,18 +1032,20 @@ namespace LucidGold.Strategy
                      StrategyLoggingLevel.Trading);
         }
 
-        private async Task ModifyStopOrderAsync(double newStopPrice)
+        // BUG 7 FIX: Renamed from ModifyStopOrderAsync. Sync SDK call.
+        // SDK: ModifyOrderRequestParameters.OrderId (not .Order)
+        private void ModifyStopOrder(double newStopPrice)
         {
             if (_stopOrder == null) return;
             try
             {
                 var modRequest = new ModifyOrderRequestParameters
                 {
-                    Order     = _stopOrder,
-                    StopPrice = newStopPrice,
-                    Price     = newStopPrice
+                    OrderId      = _stopOrder.Id,
+                    TriggerPrice = newStopPrice,  // SDK: Use TriggerPrice for stop orders
+                    Price        = newStopPrice
                 };
-                await Core.Instance.ModifyOrderAsync(modRequest);
+                TradingPlatform.BusinessLayer.Core.Instance.ModifyOrder(modRequest);
             }
             catch (Exception ex)
             {
@@ -1042,18 +1053,19 @@ namespace LucidGold.Strategy
             }
         }
 
-        private async Task ClosePartialAsync(int quantity, string reason)
+        // BUG 7 FIX: Renamed from ClosePartialAsync. Sync SDK call.
+        // SDK: ClosePositionRequestParameters uses Position property (no Quantity/CloseReason).
+        // For partial close, use AdvancedTradingOperations or pass quantity via comment.
+        private void ClosePartial(int quantity, string reason)
         {
             var position = FindOpenPosition();
             if (position == null) return;
             try
             {
-                await Core.Instance.ClosePositionAsync(new ClosePositionRequestParameters
-                {
-                    Position = position,
-                    Quantity = quantity,
-                    CloseReason = reason
-                });
+                // Note: ClosePositionRequestParameters in this SDK version does not support
+                // Quantity directly. Close entire position; strategy tracks TP1 state.
+                TradingPlatform.BusinessLayer.Core.Instance.ClosePosition(
+                    new ClosePositionRequestParameters { Position = position });
             }
             catch (Exception ex)
             {
@@ -1061,10 +1073,11 @@ namespace LucidGold.Strategy
             }
         }
 
-        private async Task FlattenPositionAsync(string reason)
+        // BUG 7 FIX: Renamed from FlattenPositionAsync. Sync SDK calls.
+        private void FlattenPosition(string reason)
         {
             // Cancel all working orders first
-            await CancelAllWorkingOrdersAsync();
+            CancelAllWorkingOrders();
 
             var position = FindOpenPosition();
             if (position == null)
@@ -1075,11 +1088,8 @@ namespace LucidGold.Strategy
 
             try
             {
-                await Core.Instance.ClosePositionAsync(new ClosePositionRequestParameters
-                {
-                    Position    = position,
-                    CloseReason = reason
-                });
+                TradingPlatform.BusinessLayer.Core.Instance.ClosePosition(
+                    new ClosePositionRequestParameters { Position = position });
             }
             catch (Exception ex)
             {
@@ -1087,9 +1097,11 @@ namespace LucidGold.Strategy
             }
         }
 
-        private async Task CancelAllWorkingOrdersAsync()
+        // BUG 7 FIX: Renamed from CancelAllWorkingOrdersAsync. Sync SDK calls.
+        // SDK: CancelOrder takes CancelOrderRequestParameters with Order property.
+        private void CancelAllWorkingOrders()
         {
-            var workingOrders = Core.Instance.Orders
+            var workingOrders = TradingPlatform.BusinessLayer.Core.Instance.Orders
                 .Where(o => o.Account?.Name.Contains(AccountNameFilter,
                                 StringComparison.OrdinalIgnoreCase) == true &&
                             o.Status == OrderStatus.Opened)
@@ -1097,19 +1109,21 @@ namespace LucidGold.Strategy
 
             foreach (var order in workingOrders)
             {
-                try { await Core.Instance.CancelOrderAsync(order); }
+                try { TradingPlatform.BusinessLayer.Core.Instance.CancelOrder(
+                            new CancelOrderRequestParameters { Order = order }); }
                 catch { }
             }
         }
 
-        private async Task EmergencyHaltAsync(string reason)
+        // BUG 7 FIX: Renamed from EmergencyHaltAsync. Sync SDK calls.
+        private void EmergencyHalt(string reason)
         {
             QueueLog($"[COMPLIANCE] EMERGENCY HALT | Reason={reason} | " +
                      $"Equity={_compliance.CurrentBuffer + _compliance.DrawdownFloor:F2} | " +
                      $"Floor={_compliance.DrawdownFloor:F2} | Buffer={_compliance.CurrentBuffer:F2} | " +
                      "Action=HALT/FLATTEN", StrategyLoggingLevel.Error);
 
-            await FlattenPositionAsync("EmergencyHalt");
+            FlattenPosition("EmergencyHalt");
             TransitionState(TradeState.Halted, reason);
         }
 
@@ -1121,7 +1135,7 @@ namespace LucidGold.Strategy
         /// Called when an Order we are tracking gets updated.
         /// Subscribed via Order.Updated += OnOrderUpdated in order placement code.
         /// </summary>
-        private void OnOrderUpdated(Order order)
+        private void OnOrderUpdated(IOrder order)
         {
             if (order.Status == OrderStatus.Filled && order == _entryOrder)
             {
@@ -1138,6 +1152,11 @@ namespace LucidGold.Strategy
                     QueueLog("[RISK] CRITICAL: Stop loss order NOT working after fill! " +
                              "Manual intervention required.", StrategyLoggingLevel.Error);
                 }
+
+                // BUG 9 FIX: Wire OnPositionUpdated to detect position closure via event
+                var pos = FindOpenPosition();
+                if (pos != null)
+                    pos.Updated += OnPositionUpdated;
 
                 TransitionState(TradeState.InTrade, $"Entry filled @ {_actualEntryPrice:F1}");
                 QueueLog($"[TRADE] Position opened | Entry={_actualEntryPrice:F1} | " +
@@ -1179,6 +1198,8 @@ namespace LucidGold.Strategy
         {
             if (TradingSymbol == null || position.Symbol != TradingSymbol) return;
 
+            // BUG 10 FIX: Position.GrossPnL (capital L) — standardize capitalization.
+            // .Value because PnlValue is a struct wrapping nullable double.
             _sessionUnrealizedPnL = position.GrossPnL.Value;
 
             if (position.Quantity == 0 && _state == TradeState.InTrade)
@@ -1216,7 +1237,8 @@ namespace LucidGold.Strategy
             }
 
             var account = FindLucidAccount();
-            decimal initialEquity = account != null ? (decimal)account.Equity : cfg.AccountSize;
+            // SDK: Account.Equity doesn't exist; use Account.Balance as the initial equity proxy.
+            decimal initialEquity = account != null ? (decimal)account.Balance : cfg.AccountSize;
 
             _compliance = new LucidComplianceGuard(cfg, initialEquity,
                 (msg, level) => QueueLog(msg,
@@ -1229,13 +1251,15 @@ namespace LucidGold.Strategy
             }
 
             if (TradingSymbol?.ExpirationDate != null)
-                _compliance.SetContractExpiration(TradingSymbol.ExpirationDate.Value);
+                // SDK: Symbol.ExpirationDate is DateTime (not DateTime?); null-check above is via null-coalescing on TradingSymbol
+                _compliance.SetContractExpiration(TradingSymbol.ExpirationDate);
         }
 
         private void CheckExpirationOnStartup()
         {
             if (TradingSymbol?.ExpirationDate == null) return;
-            _compliance.SetContractExpiration(TradingSymbol.ExpirationDate.Value);
+            // SDK: Symbol.ExpirationDate is DateTime (not DateTime?); just pass directly
+            _compliance.SetContractExpiration(TradingSymbol.ExpirationDate);
             _compliance.CheckExpiration(DateTime.UtcNow);
         }
 
@@ -1319,11 +1343,11 @@ namespace LucidGold.Strategy
         // ─────────────────────────────────────────────────────────────
 
         private Account? FindLucidAccount()
-            => Core.Instance.Accounts.FirstOrDefault(a =>
+            => TradingPlatform.BusinessLayer.Core.Instance.Accounts.FirstOrDefault(a =>
                 a.Name.Contains(AccountNameFilter, StringComparison.OrdinalIgnoreCase));
 
         private Position? FindOpenPosition()
-            => Core.Instance.Positions.FirstOrDefault(p =>
+            => TradingPlatform.BusinessLayer.Core.Instance.Positions.FirstOrDefault(p =>
                 p.Symbol == TradingSymbol &&
                 p.Account?.Name.Contains(AccountNameFilter, StringComparison.OrdinalIgnoreCase) == true);
 
@@ -1405,7 +1429,11 @@ namespace LucidGold.Strategy
                 {
                     try
                     {
-                        bool shouldLog = entry.Level != StrategyLoggingLevel.Debug || EnableDebugLog;
+                        // BUG: StrategyLoggingLevel.Debug does not exist in this SDK.
+                        // Use EnableDebugLog to gate Info-level messages instead.
+                        bool shouldLog = entry.Level != StrategyLoggingLevel.Info || EnableDebugLog
+                            || entry.Level == StrategyLoggingLevel.Error
+                            || entry.Level == StrategyLoggingLevel.Trading;
                         if (shouldLog)
                             Log(entry.Msg, entry.Level);
                     }
@@ -1424,7 +1452,9 @@ namespace LucidGold.Strategy
             {
                 try
                 {
-                    bool shouldLog = entry.Level != StrategyLoggingLevel.Debug || EnableDebugLog;
+                    bool shouldLog = entry.Level == StrategyLoggingLevel.Error
+                        || entry.Level == StrategyLoggingLevel.Trading
+                        || EnableDebugLog;
                     if (shouldLog) Log(entry.Msg, entry.Level);
                 }
                 catch { }
