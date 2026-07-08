@@ -1,0 +1,14 @@
+{
+  "account_size": 25000,
+  "profit_target": 1500,
+  "trailing_drawdown_limit": 1500,
+  "daily_loss_limit": 0,
+  "max_contracts_mgc": 10,
+  "max_contracts_gc": 1,
+  "consistency_max_day_pct": 0.30,
+  "news_flatten_minutes_before": 2,
+  "news_resume_minutes_after": 2,
+  "weekend_positions_allowed": false,
+  "emergency_buffer_dollars": 250,
+  "critical_buffer_dollars": 500
+}

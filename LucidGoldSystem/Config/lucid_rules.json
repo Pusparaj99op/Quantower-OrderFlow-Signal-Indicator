@@ -1,0 +1,19 @@
+{
+  "_comment": "=============================================================",
+  "_comment2": "lucid_rules.json — Lucid Trading Flex 25K Evaluation Rules",
+  "_comment3": "⚠️ VERIFY ALL VALUES against current official Lucid Trading",
+  "_comment4": "documentation before each live deployment. Rules change without notice.",
+  "_comment5": "=============================================================",
+
+  "account_size":             25000,
+  "profit_target":             1500,
+  "trailing_drawdown_limit":   1500,
+  "daily_loss_limit":             0,
+  "max_contracts_mgc":            5,
+  "max_contracts_gc":             1,
+  "consistency_rule_pct":        30,
+  "news_blackout_minutes":       10,
+  "max_position_hold_minutes":  240,
+  "weekend_flat_required":     true,
+  "evaluation_mode":           true
+}

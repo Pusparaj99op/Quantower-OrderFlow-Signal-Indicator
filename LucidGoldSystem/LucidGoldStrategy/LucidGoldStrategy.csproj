@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>LucidGoldStrategy</AssemblyName>
+    <RootNamespace>LucidGold.Strategy</RootNamespace>
+    <Platforms>AnyCPU</Platforms>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Quantower picks this up to identify this DLL as a strategy -->
+    <AlgoType>Strategy</AlgoType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <OutputPath>C:\Quantower\Settings\Scripts\Strategies\LucidGoldStrategy</OutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <OutputPath>C:\Quantower\Settings\Scripts\Strategies\LucidGoldStrategy</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Local SDK reference — verify path matches your Quantower installation -->
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>C:\Quantower\TradingPlatform\v1.146.13\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LucidGoldCore\LucidGoldCore.csproj" />
+  </ItemGroup>
+</Project>

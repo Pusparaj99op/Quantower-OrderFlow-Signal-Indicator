@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>LucidGoldIndicator</AssemblyName>
+    <RootNamespace>LucidGold.Indicator</RootNamespace>
+    <Platforms>AnyCPU</Platforms>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Quantower picks this up to identify this DLL as an indicator -->
+    <AlgoType>Indicator</AlgoType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <OutputPath>C:\Quantower\Settings\Scripts\Indicators\LucidGoldIndicator</OutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <OutputPath>C:\Quantower\Settings\Scripts\Indicators\LucidGoldIndicator</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Local SDK reference — verify path matches your Quantower installation -->
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>C:\Quantower\TradingPlatform\v1.146.13\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Drawing.Common" Version="10.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LucidGoldCore\LucidGoldCore.csproj" />
+  </ItemGroup>
+</Project>

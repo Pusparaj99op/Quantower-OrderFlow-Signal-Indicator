@@ -1,0 +1,1376 @@
+// ============================================================
+// LucidGoldScalperStrategy.cs
+// LucidGold.Strategy namespace
+// Quantower Strategy — autonomous order placement engine
+// ============================================================
+//
+// ⚠️ IMPORTANT: All Lucid Trading rule values in lucid_rules.json
+// MUST be verified against current official Lucid Trading documentation
+// before each live deployment. Prop firm rules change without notice.
+// This system is provided for educational and developmental purposes.
+// The author and developer accept no liability for trading losses.
+// Always trade on a paper/simulation account first.
+// Verify SDK API compatibility with your installed Quantower version.
+//
+// ============================================================
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using TradingPlatform.BusinessLayer;
+using LucidGold.Core.Engines;
+using LucidGold.Core.Enums;
+using LucidGold.Core.Models;
+using LucidGold.Core.RiskManagement;
+using CoreBar = LucidGold.Core.Models.Bar;
+using LocalAggressorSide = LucidGold.Core.Enums.AggressorSide;
+
+namespace LucidGold.Strategy
+{
+    /// <summary>
+    /// Lucid Gold Scalper — production autonomous ICT/SMC order-flow strategy.
+    /// Targets MGC or GC on Lucid Trading Flex 25K evaluation accounts.
+    ///
+    /// <para>Full 8-state machine: IDLE → SCANNING → SETUP_IDENTIFIED →
+    /// AWAITING_CONFIRMATION → ORDER_PENDING → IN_TRADE → MANAGING → FLAT → HALTED.</para>
+    ///
+    /// <para>Compliance: trailing drawdown, daily loss, consistency, news blackout,
+    /// weekend flatten, expiration guard — all loaded from lucid_rules.json.</para>
+    /// </summary>
+    public class LucidGoldScalperStrategy : TradingPlatform.BusinessLayer.Strategy
+    {
+        // ═════════════════════════════════════════════════════════════
+        // INPUT PARAMETERS
+        // ═════════════════════════════════════════════════════════════
+
+        // ── Group: Instrument ─────────────────────────────────────────
+        [InputParameter("Symbol (MGC or GC)", 10)]
+        public Symbol? TradingSymbol { get; set; }
+
+        [InputParameter("Account Name Filter", 11, "Lucid")]
+        public string AccountNameFilter { get; set; } = "Lucid";
+
+        // ── Group: Risk ───────────────────────────────────────────────
+        [InputParameter("Max Stop Loss Ticks", 20, 1, 1, 50, 1)]
+        public int MaxStopLossTicks { get; set; } = 50;
+
+        [InputParameter("Min Profit Target Ticks", 21, 1, 100, 500, 5)]
+        public int MinProfitTargetTicks { get; set; } = 100;
+
+        [InputParameter("Min Reward/Risk Ratio", 22, 0.1, 2.0, 10.0, 0.1)]
+        public double MinRRRatio { get; set; } = 2.0;
+
+        [InputParameter("Max Contracts", 23, 1, 1, 10, 1)]
+        public int MaxContracts { get; set; } = 1;
+
+        // ── Group: Entry ──────────────────────────────────────────────
+        [InputParameter("Min Signal Score (60–90)", 30, 1, 60, 90, 1)]
+        public int MinSignalScore { get; set; } = 65;
+
+        [InputParameter("Max Setup Wait Minutes", 31, 1, 30, 120, 5)]
+        public int MaxSetupWaitMinutes { get; set; } = 30;
+
+        [InputParameter("Max Fill Wait Minutes", 32, 1, 15, 60, 1)]
+        public int MaxFillWaitMinutes { get; set; } = 15;
+
+        [InputParameter("Use Limit Orders (false = market)", 33)]
+        public bool UseLimitOrders { get; set; } = true;
+
+        // ── Group: Exits ──────────────────────────────────────────────
+        [InputParameter("Breakeven At Ticks Profit", 40, 1, 25, 100, 5)]
+        public int BreakevenAtTicks { get; set; } = 25;
+
+        [InputParameter("TP1 Ticks", 41, 1, 100, 500, 10)]
+        public int TP1Ticks { get; set; } = 100;
+
+        [InputParameter("TP2 Ticks", 42, 1, 200, 1000, 10)]
+        public int TP2Ticks { get; set; } = 200;
+
+        [InputParameter("Max Trade Duration Minutes", 43, 1, 120, 480, 10)]
+        public int MaxTradeDurationMinutes { get; set; } = 120;
+
+        [InputParameter("Enable Time Stop", 44)]
+        public bool EnableTimeStop { get; set; } = true;
+
+        // ── Group: Sessions ───────────────────────────────────────────
+        [InputParameter("Enable London Kill Zone", 50)]
+        public bool EnableLondon { get; set; } = true;
+
+        [InputParameter("Enable NY Kill Zone", 51)]
+        public bool EnableNY { get; set; } = true;
+
+        [InputParameter("Enable London Close", 52)]
+        public bool EnableLondonClose { get; set; } = false;
+
+        [InputParameter("Enable Afternoon Session", 53)]
+        public bool EnableAfternoon { get; set; } = false;
+
+        // ── Group: Filters ────────────────────────────────────────────
+        [InputParameter("Min ATR (ticks, 20-period)", 60, 0.1, 8.0, 200.0, 0.5)]
+        public double MinATR { get; set; } = 8.0;
+
+        [InputParameter("Max ATR (ticks, 20-period)", 61, 1.0, 80.0, 500.0, 1.0)]
+        public double MaxATR { get; set; } = 80.0;
+
+        [InputParameter("Max Daily Trades", 62, 1, 3, 20, 1)]
+        public int MaxDailyTrades { get; set; } = 3;
+
+        [InputParameter("Large Lot Threshold MGC", 63, 1, 50, 500, 5)]
+        public int LargeLotMGC { get; set; } = 50;
+
+        [InputParameter("Large Lot Threshold GC", 64, 1, 10, 100, 1)]
+        public int LargeLotGC { get; set; } = 10;
+
+        // ── Group: Config Paths ───────────────────────────────────────
+        [InputParameter("Lucid Rules JSON Path", 70, "C:\\Quantower\\Config\\lucid_rules.json")]
+        public string LucidRulesPath { get; set; } = @"C:\Quantower\Config\lucid_rules.json";
+
+        [InputParameter("News Events CSV Path", 71, "C:\\Quantower\\Config\\news_events.csv")]
+        public string NewsEventsPath { get; set; } = @"C:\Quantower\Config\news_events.csv";
+
+        // ── Group: Debug ──────────────────────────────────────────────
+        [InputParameter("Enable Debug Logging", 80)]
+        public bool EnableDebugLog { get; set; } = false;
+
+        [InputParameter("Log Tick Data (Warning: large files)", 81)]
+        public bool LogTickData { get; set; } = false;
+
+        // ═════════════════════════════════════════════════════════════
+        // SIGNAL ENGINES
+        // ═════════════════════════════════════════════════════════════
+
+        private MarketStructureEngine _msEngine5M  = null!;
+        private MarketStructureEngine _msEngine15M = null!;
+        private FVGEngine             _fvgEngine   = null!;
+        private OrderBlockEngine      _obEngine    = null!;
+        private HTFBiasEngine         _htfEngine   = null!;
+        private KillZoneEngine        _kzEngine    = null!;
+        private CumulativeDeltaEngine _deltaEngine = null!;
+        private FootprintEngine       _fpEngine    = null!;
+        private DOMAbsorptionEngine   _domEngine   = null!;
+        private TapeReadingEngine     _tapeEngine  = null!;
+        private VolumeProfileEngine   _vpEngine    = null!;
+        private SignalScoringEngine   _scoreEngine = null!;
+        private RiskCalculator        _riskCalc    = null!;
+        private LucidComplianceGuard  _compliance  = null!;
+
+        // ═════════════════════════════════════════════════════════════
+        // STATE MACHINE
+        // ═════════════════════════════════════════════════════════════
+
+        private volatile TradeState _state = TradeState.Idle;
+        private readonly object     _stateLock = new object();
+
+        private TradeSignal?  _activeSignal;
+        private DateTime      _setupIdentifiedTime;
+        private DateTime      _orderPlacedTime;
+        private DateTime      _entryFilledTime;
+        private SignalDirection _setupDirection = SignalDirection.Long;
+
+        // ═════════════════════════════════════════════════════════════
+        // ORDER TRACKING
+        // ═════════════════════════════════════════════════════════════
+
+        private Order?  _entryOrder;
+        private Order?  _stopOrder;
+        private Order?  _tp1Order;
+        private Order?  _tp2Order;
+        private double  _actualEntryPrice;
+        private int     _entryQuantity;
+        private bool    _tp1Hit;
+        private bool    _breakevenMoved;
+        private double  _trailingStopPrice;
+
+        // ═════════════════════════════════════════════════════════════
+        // SESSION / DAILY TRACKING
+        // ═════════════════════════════════════════════════════════════
+
+        private int    _dailyTradeCount;
+        private double _sessionRealizedPnL;
+        private double _sessionUnrealizedPnL;
+        private DateTime _lastHeartbeatTime = DateTime.MinValue;
+        private static readonly TimeZoneInfo ET =
+            TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+
+        // ═════════════════════════════════════════════════════════════
+        // INSTRUMENT CONFIG
+        // ═════════════════════════════════════════════════════════════
+
+        private double _tickSize  = 0.1;
+        private double _tickValue = 1.0;
+        private bool   _isMGC    = true;
+        private long   _largeLotThreshold = 50;
+
+        // ═════════════════════════════════════════════════════════════
+        // LOCK-FREE LOGGING QUEUE
+        // ═════════════════════════════════════════════════════════════
+
+        private readonly ConcurrentQueue<(string Msg, StrategyLoggingLevel Level)> _logQueue
+            = new ConcurrentQueue<(string, StrategyLoggingLevel)>();
+        private Thread? _logThread;
+        private volatile bool _logRunning;
+
+        // ═════════════════════════════════════════════════════════════
+        // CONSTRUCTOR
+        // ═════════════════════════════════════════════════════════════
+
+        public LucidGoldScalperStrategy()
+        {
+            Name        = "Lucid Gold Scalper";
+            Description = "Production ICT/SMC/Order-Flow autonomous strategy for MGC/GC " +
+                          "on Lucid Flex 25K evaluation. Reads lucid_rules.json for compliance.";
+            Version     = "1.0.0";
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // LIFECYCLE — OnCreated
+        // ═════════════════════════════════════════════════════════════
+
+        protected override void OnCreated()
+        {
+            base.OnCreated();
+
+            // Detect instrument
+            string symName = TradingSymbol?.Name ?? "MGC";
+            _isMGC    = symName.Contains("MGC", StringComparison.OrdinalIgnoreCase);
+            _tickSize = _isMGC ? 0.1  : 0.1;
+            _tickValue= _isMGC ? 1.0  : 10.0;
+            _largeLotThreshold = _isMGC ? LargeLotMGC : LargeLotGC;
+
+            // Instantiate all engines
+            _msEngine5M  = new MarketStructureEngine();
+            _msEngine15M = new MarketStructureEngine();
+            _fvgEngine   = new FVGEngine(_tickSize);
+            _obEngine    = new OrderBlockEngine(_tickSize);
+            _htfEngine   = new HTFBiasEngine(msg => QueueLog(msg, StrategyLoggingLevel.Info));
+            _kzEngine    = new KillZoneEngine();
+            _deltaEngine = new CumulativeDeltaEngine();
+            _fpEngine    = new FootprintEngine(_tickSize);
+            _domEngine   = new DOMAbsorptionEngine(_largeLotThreshold);
+            _tapeEngine  = new TapeReadingEngine();
+            _vpEngine    = new VolumeProfileEngine(_tickSize);
+            _scoreEngine = new SignalScoringEngine();
+            _riskCalc    = new RiskCalculator(symName, _tickSize, _tickValue);
+
+            // Load compliance config
+            LoadComplianceConfig();
+
+            // Start lock-free log thread
+            _logRunning = true;
+            _logThread  = new Thread(LogThreadProc) { IsBackground = true, Name = "LucidGold-Log" };
+            _logThread.Start();
+
+            QueueLog($"[INIT] LucidGoldScalper created | Symbol={symName} | " +
+                     $"TickSize={_tickSize} | TickValue={_tickValue:C}",
+                     StrategyLoggingLevel.Info);
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // LIFECYCLE — OnRun
+        // ═════════════════════════════════════════════════════════════
+
+        protected override void OnRun()
+        {
+            base.OnRun();
+
+            if (TradingSymbol == null)
+            {
+                QueueLog("[FATAL] TradingSymbol not configured. Strategy halted.",
+                         StrategyLoggingLevel.Error);
+                TransitionState(TradeState.Halted, "No symbol configured");
+                return;
+            }
+
+            // Subscribe to all market data events
+            TradingSymbol.NewTrade    += Symbol_NewTrade;
+            TradingSymbol.NewLevel2   += Symbol_NewLevel2;
+            TradingSymbol.NewBar      += Symbol_NewBar;
+            TradingSymbol.NewQuote    += Symbol_NewQuote;
+
+            // Verify contract expiration
+            CheckExpirationOnStartup();
+
+            TransitionState(TradeState.Scanning, "Strategy started");
+
+            // Start heartbeat timer task
+            _ = Task.Run(HeartbeatLoopAsync);
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // LIFECYCLE — OnStop
+        // ═════════════════════════════════════════════════════════════
+
+        protected override void OnStop()
+        {
+            base.OnStop();
+
+            // Unsubscribe all events
+            if (TradingSymbol != null)
+            {
+                TradingSymbol.NewTrade  -= Symbol_NewTrade;
+                TradingSymbol.NewLevel2 -= Symbol_NewLevel2;
+                TradingSymbol.NewBar    -= Symbol_NewBar;
+                TradingSymbol.NewQuote  -= Symbol_NewQuote;
+            }
+
+            // Stop log thread
+            _logRunning = false;
+            FlushLogQueue();
+
+            TransitionState(TradeState.Halted, "OnStop called");
+
+            // Dispose DOM engine
+            _domEngine?.Dispose();
+
+            QueueLog("[STATE] Strategy stopped.", StrategyLoggingLevel.Info);
+            FlushLogQueue();
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // EVENT — OnNewTrade (HOT PATH — must return in < 1 ms)
+        // ═════════════════════════════════════════════════════════════
+
+        private void Symbol_NewTrade(Symbol sym, Trade trade)
+        {
+            var side = trade.Aggressor == AggressorFlag.Buy  ? LocalAggressorSide.Buy
+                     : trade.Aggressor == AggressorFlag.Sell ? LocalAggressorSide.Sell
+                     : LocalAggressorSide.Unknown;
+
+            // Lock-free engine updates (< 1 µs each)
+            _deltaEngine.ProcessTrade(trade.Price, (long)trade.Size, side);
+            _fpEngine.ProcessTrade(trade.Price, (long)trade.Size, side);
+            _tapeEngine.ProcessTrade(trade.Price, (long)trade.Size, side, trade.Time, _largeLotThreshold);
+            _vpEngine.ProcessTrade(trade.Price, (long)trade.Size);
+
+            if (LogTickData)
+                QueueLog($"[TICK] {trade.Price:F1} x{trade.Size} {side}", StrategyLoggingLevel.Debug);
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // EVENT — OnNewLevel2 (DOM)
+        // ═════════════════════════════════════════════════════════════
+
+        private void Symbol_NewLevel2(Symbol sym, Level2Quote quote)
+        {
+            var side    = quote.Type == Level2Type.Bid ? QuoteSide.Bid : QuoteSide.Ask;
+            var domQuote = new DomLevel2Quote(quote.Price, (long)quote.Size, side, quote.Time);
+            _domEngine.ProcessLevel2(domQuote);
+
+            // Notify DOM engine of aggressive trades for absorption detection
+            // (cross-reference with last trade via a lightweight check)
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // EVENT — OnNewBar
+        // ═════════════════════════════════════════════════════════════
+
+        private void Symbol_NewBar(Symbol sym, Period period, HistoryItemBar bar)
+        {
+            // Dispatch to background so event thread returns in < 1 ms
+            Task.Run(() => ProcessBarAsync(sym, period, bar));
+        }
+
+        private void ProcessBarAsync(Symbol sym, Period period, HistoryItemBar bar)
+        {
+            try
+            {
+                var coreBar = new CoreBar
+                {
+                    Time   = bar.TimeLeft,
+                    Open   = bar.Open,
+                    High   = bar.High,
+                    Low    = bar.Low,
+                    Close  = bar.Close,
+                    Volume = bar.Volume
+                };
+
+                string tf = period.ToString();
+
+                // 5-minute bars drive primary structure
+                if (period == Period.MIN5)
+                {
+                    _msEngine5M.ProcessNewBar(coreBar, "5M");
+                    _fvgEngine.ProcessNewBar(
+                        PriorBar(1, coreBar), PriorBar(0, coreBar), coreBar, "5M");
+                }
+                else if (period == Period.MIN15)
+                {
+                    _msEngine15M.ProcessNewBar(coreBar, "15M");
+                }
+
+                _fpEngine.OnBarClose(bar.High, bar.Low, bar.Close, bar.TimeLeft);
+                _deltaEngine.OnBarClose(bar.High, bar.Low);
+                _domEngine.EvaluateConditions();
+                _vpEngine.CheckSessionReset(bar.TimeLeft.ToUniversalTime());
+
+                // Check daily session reset
+                CheckDailySessionReset();
+
+                // Periodic HTF bias refresh
+                _ = Task.Run(async () => await RefreshHTFBiasAsync(sym.Name));
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[ERROR] ProcessBarAsync: {ex.Message}", StrategyLoggingLevel.Error);
+            }
+        }
+
+        // Simple prior bar cache (last 3 bars for FVG)
+        private readonly CoreBar?[] _priorBarCache = new CoreBar?[3];
+        private int _priorBarIdx = 0;
+
+        private CoreBar PriorBar(int offset, CoreBar current)
+        {
+            _priorBarCache[_priorBarIdx % 3] = current;
+            _priorBarIdx++;
+            int target = _priorBarIdx - 1 - offset;
+            if (target < 0) return current;
+            return _priorBarCache[target % 3] ?? current;
+        }
+
+        private async Task RefreshHTFBiasAsync(string symbolName)
+        {
+            try
+            {
+                // Only refresh if 15 min have passed (throttled inside HTFBiasEngine)
+                var dailyBars = await FetchBarsAsync(symbolName, Period.DAY1, 50);
+                var h4Bars    = await FetchBarsAsync(symbolName, new Period(PeriodType.Hour, 4), 50);
+                _htfEngine.Refresh(dailyBars, h4Bars);
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[WARN] HTF refresh failed: {ex.Message}", StrategyLoggingLevel.Info);
+            }
+        }
+
+        private async Task<IEnumerable<CoreBar>> FetchBarsAsync(string symbol, Period period, int count)
+        {
+            try
+            {
+                var sym = Core.Instance.Symbols.FirstOrDefault(s => s.Name == symbol);
+                if (sym == null) return Enumerable.Empty<CoreBar>();
+
+                var request = new HistoryRequestParameters
+                {
+                    Symbol      = sym,
+                    Period      = period,
+                    FromTime    = DateTime.UtcNow.AddDays(-count),
+                    ToTime      = DateTime.UtcNow,
+                    Aggregation = new SimpleAggregation()
+                };
+
+                var history = await Core.Instance.GetHistoryAsync(request);
+                return history.Select(item =>
+                {
+                    if (item is HistoryItemBar b)
+                        return new CoreBar { Time=item.TimeLeft, Open=b.Open, High=b.High,
+                                             Low=b.Low, Close=b.Close, Volume=b.Volume };
+                    double p = item[PriceType.Close];
+                    return new CoreBar { Time=item.TimeLeft, Open=p, High=p, Low=p, Close=p };
+                }).ToList();
+            }
+            catch { return Enumerable.Empty<CoreBar>(); }
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // EVENT — OnNewQuote (state machine evaluation)
+        // ═════════════════════════════════════════════════════════════
+
+        private void Symbol_NewQuote(Symbol sym, Quote quote)
+        {
+            // Dispatch to background — do not run state machine on platform event thread
+            Task.Run(() => EvaluateStateMachineAsync(sym, quote));
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // STATE MACHINE EVALUATION
+        // ═════════════════════════════════════════════════════════════
+
+        private async Task EvaluateStateMachineAsync(Symbol sym, Quote quote)
+        {
+            try
+            {
+                TradeState currentState;
+                lock (_stateLock) currentState = _state;
+
+                double bid = quote.Bid;
+                double ask = quote.Ask;
+                double mid = (bid + ask) / 2.0;
+
+                // ── Compliance heartbeat checks ─────────────────────────────
+                var account = FindLucidAccount();
+                if (account != null)
+                {
+                    decimal equity = (decimal)account.Equity;
+                    decimal realPnL = (decimal)account.TodayRealizedPnL;
+                    _compliance.UpdateEquity(equity, realPnL, (decimal)account.TodayUnrealizedPnL);
+
+                    if (_compliance.IsEmergencyHalt && currentState != TradeState.Halted)
+                    {
+                        await EmergencyHaltAsync("DrawdownFloor breached");
+                        return;
+                    }
+                }
+
+                // ── Weekend flatten ─────────────────────────────────────────
+                if (_compliance.ShouldFlattenForWeekend(DateTime.UtcNow) &&
+                    currentState == TradeState.InTrade)
+                {
+                    await FlattenPositionAsync("WeekendFlat");
+                    return;
+                }
+
+                // ── News flatten ────────────────────────────────────────────
+                if (_compliance.ShouldFlattenForNews(DateTime.UtcNow) &&
+                    currentState == TradeState.InTrade)
+                {
+                    await FlattenPositionAsync("NewsFlatten");
+                    return;
+                }
+
+                // ── State-specific logic ────────────────────────────────────
+                switch (currentState)
+                {
+                    case TradeState.Halted:
+                        CheckDailyReset_Halt();
+                        break;
+
+                    case TradeState.Idle:
+                        EvaluateIdleToScanning();
+                        break;
+
+                    case TradeState.Scanning:
+                        await EvaluateScanningAsync(mid);
+                        break;
+
+                    case TradeState.SetupIdentified:
+                        await EvaluateSetupIdentifiedAsync(mid);
+                        break;
+
+                    case TradeState.AwaitingConfirmation:
+                        await EvaluateAwaitingConfirmationAsync(mid, bid, ask);
+                        break;
+
+                    case TradeState.OrderPending:
+                        EvaluateOrderPending(mid);
+                        break;
+
+                    case TradeState.InTrade:
+                    case TradeState.Managing:
+                        await EvaluatePositionManagementAsync(mid, bid, ask);
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[ERROR] StateMachine: {ex.Message}", StrategyLoggingLevel.Error);
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // State: IDLE
+        // ─────────────────────────────────────────────────────────────
+
+        private void EvaluateIdleToScanning()
+        {
+            // Enter scanning only during a kill zone
+            string kz = _kzEngine.GetActiveKillZoneName(DateTime.UtcNow,
+                            EnableLondon, EnableNY, EnableLondonClose, EnableAfternoon);
+            if (kz != "None")
+                TransitionState(TradeState.Scanning, $"Kill zone active: {kz}");
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // State: SCANNING
+        // ─────────────────────────────────────────────────────────────
+
+        private async Task EvaluateScanningAsync(double mid)
+        {
+            // Exit scanning if kill zone ends
+            string kz = _kzEngine.GetActiveKillZoneName(DateTime.UtcNow,
+                            EnableLondon, EnableNY, EnableLondonClose, EnableAfternoon);
+            if (kz == "None")
+            {
+                TransitionState(TradeState.Idle, "Kill zone ended");
+                return;
+            }
+
+            // ATR filter
+            double atr20 = _msEngine5M.GetATR20();
+            if (atr20 < MinATR * _tickSize || atr20 > MaxATR * _tickSize) return;
+
+            // HTF bias check
+            var bias = _htfEngine.GetCurrentBias();
+            if (bias == MarketBias.Neutral) return;
+
+            SignalDirection dir = bias is MarketBias.StrongBullish or MarketBias.Bullish
+                ? SignalDirection.Long : SignalDirection.Short;
+
+            // Check for market structure event (MSS or CHoCH)
+            var ms = _msEngine5M.GetLatestStructureEvent();
+            if (ms == null) return;
+            if (ms.Direction != dir) return;
+            if (ms.EventType == StructureEventType.BOS) return; // Need at least CHoCH for scanning
+
+            // Build setup context
+            var ctx = BuildSetupContext(mid, kz, bias, dir);
+            float score = _scoreEngine.ScoreSetup(ctx, dir);
+
+            if (score >= MinSignalScore)
+            {
+                ctx.SignalScore = score;
+                // Build TradeSignal
+                double swingStop = dir == SignalDirection.Long
+                    ? _msEngine5M.GetSwingLow()
+                    : _msEngine5M.GetSwingHigh();
+
+                var signal = _riskCalc.CalculateTrade(mid, swingStop, dir,
+                    TP1Ticks, TP2Ticks, 1, score, ctx,
+                    $"Score={score:F0}|KZ={kz}|Bias={bias}|MSS={ms.EventType}");
+
+                if (signal == null)
+                {
+                    QueueLog($"[SCAN] Signal rejected by RiskCalc | Score={score:F0} | " +
+                             $"NaturalSL too wide or RR < {MinRRRatio:F1}",
+                             StrategyLoggingLevel.Info);
+                    return;
+                }
+
+                _activeSignal        = signal;
+                _setupDirection      = dir;
+                _setupIdentifiedTime = DateTime.UtcNow;
+
+                QueueLog($"[SETUP] Direction={dir} | Score={score:F0} | HTF={bias} | " +
+                         $"KZ={kz} | FVG={ctx.NearestFVG?.Top:F1}-{ctx.NearestFVG?.Bottom:F1} | " +
+                         $"OB={ctx.NearestOrderBlock?.Top:F1}-{ctx.NearestOrderBlock?.Bottom:F1} | " +
+                         $"MSS={ms.Price:F1} | ATR={atr20:F1}",
+                         StrategyLoggingLevel.Trading);
+
+                TransitionState(TradeState.SetupIdentified, $"Score={score:F0}");
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // State: SETUP_IDENTIFIED
+        // ─────────────────────────────────────────────────────────────
+
+        private async Task EvaluateSetupIdentifiedAsync(double mid)
+        {
+            if (_activeSignal == null) { TransitionState(TradeState.Scanning, "Signal lost"); return; }
+
+            // Wait for price to approach entry zone
+            double entryZoneTop    = _activeSignal.Context.EntryZoneTop;
+            double entryZoneBottom = _activeSignal.Context.EntryZoneBottom;
+
+            if (entryZoneTop <= 0 || entryZoneBottom <= 0)
+            {
+                // If no specific entry zone, advance to confirmation immediately
+                TransitionState(TradeState.AwaitingConfirmation, "No entry zone — immediate confirm");
+                return;
+            }
+
+            bool priceInZone = mid >= entryZoneBottom && mid <= entryZoneTop;
+            if (!priceInZone)
+            {
+                // Invalidate if waited too long
+                if ((DateTime.UtcNow - _setupIdentifiedTime).TotalMinutes > MaxSetupWaitMinutes)
+                {
+                    QueueLog($"[SETUP] Expired after {MaxSetupWaitMinutes}min waiting for entry zone.",
+                             StrategyLoggingLevel.Info);
+                    _activeSignal = null;
+                    TransitionState(TradeState.Scanning, "Setup expired — price never reached zone");
+                }
+                return;
+            }
+
+            // Re-score the setup
+            string kz   = _kzEngine.GetActiveKillZoneName(DateTime.UtcNow, EnableLondon, EnableNY, EnableLondonClose, EnableAfternoon);
+            var    bias  = _htfEngine.GetCurrentBias();
+            var    ctx   = BuildSetupContext(mid, kz, bias, _setupDirection);
+            float  score = _scoreEngine.ScoreSetup(ctx, _setupDirection);
+
+            if (score < 50)
+            {
+                QueueLog($"[SETUP] Score degraded to {score:F0} < 50 — cancelling setup.",
+                         StrategyLoggingLevel.Info);
+                _activeSignal = null;
+                TransitionState(TradeState.Scanning, "Score degraded below 50");
+                return;
+            }
+
+            TransitionState(TradeState.AwaitingConfirmation, $"Price in entry zone, score={score:F0}");
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // State: AWAITING_CONFIRMATION
+        // ─────────────────────────────────────────────────────────────
+
+        private async Task EvaluateAwaitingConfirmationAsync(double mid, double bid, double ask)
+        {
+            if (_activeSignal == null) { TransitionState(TradeState.Scanning, "Signal lost"); return; }
+
+            // Check all final confirmation conditions
+            bool domAbsorption  = _domEngine.IsAbsorptionActive();
+            bool tapeOk         = !_tapeEngine.IsTapeExhaustion(_setupDirection == SignalDirection.Long
+                                                 ? SignalDirection.Short : SignalDirection.Long);
+            bool deltaOk        = !_deltaEngine.IsDeltaDivergent(_setupDirection);
+
+            // Compliance pre-entry check
+            if (!_compliance.PreEntryCheck(_activeSignal, DateTime.UtcNow))
+            {
+                TransitionState(TradeState.Scanning, "Compliance PreEntryCheck blocked");
+                _activeSignal = null;
+                return;
+            }
+
+            // Daily trade limit check
+            if (_dailyTradeCount >= MaxDailyTrades)
+            {
+                QueueLog($"[COMPLIANCE] Daily trade limit reached ({MaxDailyTrades}). Halting.",
+                         StrategyLoggingLevel.Error);
+                TransitionState(TradeState.Halted, "DailyTradeLimit");
+                return;
+            }
+
+            if (!tapeOk || !deltaOk)
+            {
+                // Not confirmed — check timeout
+                if ((DateTime.UtcNow - _setupIdentifiedTime).TotalMinutes > MaxSetupWaitMinutes)
+                {
+                    QueueLog("[AWAIT] Confirmation timeout — cancelling setup.", StrategyLoggingLevel.Info);
+                    _activeSignal = null;
+                    TransitionState(TradeState.Scanning, "Confirmation timeout");
+                }
+                return;
+            }
+
+            // All confirmations satisfied — place order
+            await PlaceEntryOrderAsync(bid, ask);
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // State: ORDER_PENDING
+        // ─────────────────────────────────────────────────────────────
+
+        private void EvaluateOrderPending(double mid)
+        {
+            if (_entryOrder == null)
+            {
+                TransitionState(TradeState.Scanning, "Entry order lost");
+                return;
+            }
+
+            // Cancel if fill wait exceeded
+            if ((DateTime.UtcNow - _orderPlacedTime).TotalMinutes > MaxFillWaitMinutes)
+            {
+                QueueLog($"[ORDER] Fill timeout ({MaxFillWaitMinutes}min). Cancelling entry order.",
+                         StrategyLoggingLevel.Info);
+                _ = Task.Run(async () =>
+                {
+                    await Core.Instance.CancelOrderAsync(_entryOrder);
+                    _entryOrder = null;
+                    _activeSignal = null;
+                    TransitionState(TradeState.Scanning, "Fill timeout");
+                });
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // State: IN_TRADE / MANAGING
+        // ─────────────────────────────────────────────────────────────
+
+        private async Task EvaluatePositionManagementAsync(double mid, double bid, double ask)
+        {
+            if (_activeSignal == null) return;
+
+            var position = FindOpenPosition();
+            if (position == null)
+            {
+                TransitionState(TradeState.Flat, "Position no longer exists");
+                return;
+            }
+
+            double unrealizedPnL = position.GrossPnl;
+            _sessionUnrealizedPnL = unrealizedPnL;
+
+            double ticksProfit = _setupDirection == SignalDirection.Long
+                ? (mid - _actualEntryPrice) / _tickSize
+                : (_actualEntryPrice - mid) / _tickSize;
+
+            // ── Conviction Reversal: immediate close ─────────────────
+            var fpSig = _fpEngine.GetSignalSummary();
+            bool stackedAgainst = _setupDirection == SignalDirection.Long
+                ? fpSig.HasStackedBearishImbalance
+                : fpSig.HasStackedBullishImbalance;
+            bool domAgainst = (_setupDirection == SignalDirection.Long &&
+                               _domEngine.GetImbalanceSignal() == DOMImbalanceSignal.AskHeavy) ||
+                              (_setupDirection == SignalDirection.Short &&
+                               _domEngine.GetImbalanceSignal() == DOMImbalanceSignal.BidHeavy);
+
+            if (stackedAgainst && domAgainst)
+            {
+                QueueLog("[MANAGE] Conviction reversal: stacked imbalance + DOM against position. " +
+                         "Closing immediately.", StrategyLoggingLevel.Trading);
+                await FlattenPositionAsync("ConvictionReversal");
+                return;
+            }
+
+            // ── Time Stop ────────────────────────────────────────────
+            if (EnableTimeStop &&
+                (DateTime.UtcNow - _entryFilledTime).TotalMinutes > MaxTradeDurationMinutes &&
+                ticksProfit < TP1Ticks)
+            {
+                QueueLog($"[MANAGE] Time stop triggered after {MaxTradeDurationMinutes}min. " +
+                         "Price has not reached TP1.", StrategyLoggingLevel.Trading);
+                await FlattenPositionAsync("TimeStop");
+                return;
+            }
+
+            // ── Breakeven Rule ───────────────────────────────────────
+            if (!_breakevenMoved && ticksProfit >= BreakevenAtTicks)
+            {
+                double bePrice = _setupDirection == SignalDirection.Long
+                    ? _actualEntryPrice + 2 * _tickSize
+                    : _actualEntryPrice - 2 * _tickSize;
+
+                await ModifyStopOrderAsync(bePrice);
+                _breakevenMoved = true;
+                QueueLog($"[MANAGE] Breakeven moved to {bePrice:F1} | Ticks profit={ticksProfit:F0}",
+                         StrategyLoggingLevel.Trading);
+            }
+
+            // ── TP1 Rule ─────────────────────────────────────────────
+            if (!_tp1Hit && ticksProfit >= TP1Ticks && position.Quantity > 1)
+            {
+                // Close 50% of position
+                int closeQty = (int)(Math.Ceiling(position.Quantity / 2.0));
+                await ClosePartialAsync(closeQty, $"TP1 @ {mid:F1}");
+                _tp1Hit = true;
+
+                // Move SL to TP1 - 5 ticks
+                double lockInPrice = _setupDirection == SignalDirection.Long
+                    ? _activeSignal.TP1Price - 5 * _tickSize
+                    : _activeSignal.TP1Price + 5 * _tickSize;
+                await ModifyStopOrderAsync(lockInPrice);
+
+                QueueLog($"[MANAGE] TP1 hit @ {mid:F1}. Closed {closeQty} contracts. " +
+                         $"SL locked to {lockInPrice:F1}", StrategyLoggingLevel.Trading);
+            }
+
+            // ── TP2 ATR Trailing Stop ─────────────────────────────────
+            if (_tp1Hit && ticksProfit >= TP2Ticks)
+            {
+                double atr = _msEngine5M.GetATR20();
+                double newTrail = _setupDirection == SignalDirection.Long
+                    ? mid - atr * 1.5
+                    : mid + atr * 1.5;
+
+                bool shouldMove = _setupDirection == SignalDirection.Long
+                    ? newTrail > _trailingStopPrice
+                    : _trailingStopPrice == 0 || newTrail < _trailingStopPrice;
+
+                if (shouldMove)
+                {
+                    _trailingStopPrice = newTrail;
+                    await ModifyStopOrderAsync(_trailingStopPrice);
+                    QueueLog($"[MANAGE] ATR trail stop moved to {_trailingStopPrice:F1}",
+                             StrategyLoggingLevel.Info);
+                }
+            }
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // ORDER OPERATIONS
+        // ═════════════════════════════════════════════════════════════
+
+        private async Task PlaceEntryOrderAsync(double bid, double ask)
+        {
+            if (_activeSignal == null) return;
+
+            var account = FindLucidAccount();
+            if (account == null)
+            {
+                QueueLog("[ORDER] No Lucid account found. Cannot place entry.", StrategyLoggingLevel.Error);
+                return;
+            }
+
+            // Determine quantity
+            int qty = MaxContracts;
+            if (_activeSignal.Score >= 80 && MaxContracts > 1)
+                qty = MaxContracts;  // Already capped by compliance
+            else
+                qty = 1;
+
+            // Validate contract limit
+            if (_compliance.IsContractLimitExceeded(TradingSymbol?.Name ?? "MGC", qty))
+            {
+                QueueLog($"[ORDER] Contract limit exceeded for qty={qty}.", StrategyLoggingLevel.Error);
+                return;
+            }
+
+            double entryPrice = _activeSignal.Direction == SignalDirection.Long ? ask : bid;
+
+            var orderType = UseLimitOrders ? OrderType.Limit : OrderType.Market;
+            double? limitPrice = UseLimitOrders ? entryPrice : (double?)null;
+
+            var entryRequest = new PlaceOrderRequestParameters
+            {
+                Symbol      = TradingSymbol!,
+                Account     = account,
+                Side        = _activeSignal.Direction == SignalDirection.Long ? Side.Buy : Side.Sell,
+                OrderTypeId = orderType,
+                Price       = limitPrice ?? 0,
+                Quantity    = qty,
+                TimeInForce = TimeInForce.Day,
+                Comment     = $"LucidGold|Score={_activeSignal.Score:F0}|{_activeSignal.Direction}"
+            };
+
+            var result = await Core.Instance.PlaceOrderAsync(entryRequest);
+            if (result.Status == TradingOperationResultStatus.Failure)
+            {
+                QueueLog($"[ORDER] Entry order failed: {result.Message}", StrategyLoggingLevel.Error);
+                return;
+            }
+
+            _entryOrder    = result.Order;
+            _entryQuantity = qty;
+            _orderPlacedTime = DateTime.UtcNow;
+            TransitionState(TradeState.OrderPending, $"Entry order placed @ {entryPrice:F1}");
+
+            // Place stop loss order simultaneously
+            double slPrice = _activeSignal.StopPrice;
+            var slRequest = new PlaceOrderRequestParameters
+            {
+                Symbol      = TradingSymbol!,
+                Account     = account,
+                Side        = _activeSignal.Direction == SignalDirection.Long ? Side.Sell : Side.Buy,
+                OrderTypeId = OrderType.Stop,
+                StopPrice   = slPrice,
+                Quantity    = qty,
+                TimeInForce = TimeInForce.GTC,
+                Comment     = "LucidGold|SL"
+            };
+
+            var slResult = await Core.Instance.PlaceOrderAsync(slRequest);
+            _stopOrder = slResult.Status == TradingOperationResultStatus.Success
+                ? slResult.Order : null;
+
+            if (_stopOrder == null)
+                QueueLog("[ORDER] WARNING: Stop loss order failed to place! Monitor manually.",
+                         StrategyLoggingLevel.Error);
+
+            QueueLog($"[ENTRY] Symbol={TradingSymbol?.Name} | Side={_activeSignal.Direction} | " +
+                     $"Qty={qty} | Entry={entryPrice:F1} | SL={slPrice:F1} | " +
+                     $"TP1={_activeSignal.TP1Price:F1} | TP2={_activeSignal.TP2Price:F1} | " +
+                     $"RR={_activeSignal.RRRatio:F2} | Score={_activeSignal.Score:F0}",
+                     StrategyLoggingLevel.Trading);
+        }
+
+        private async Task ModifyStopOrderAsync(double newStopPrice)
+        {
+            if (_stopOrder == null) return;
+            try
+            {
+                var modRequest = new ModifyOrderRequestParameters
+                {
+                    Order     = _stopOrder,
+                    StopPrice = newStopPrice,
+                    Price     = newStopPrice
+                };
+                await Core.Instance.ModifyOrderAsync(modRequest);
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[ORDER] ModifyStop failed: {ex.Message}", StrategyLoggingLevel.Error);
+            }
+        }
+
+        private async Task ClosePartialAsync(int quantity, string reason)
+        {
+            var position = FindOpenPosition();
+            if (position == null) return;
+            try
+            {
+                await Core.Instance.ClosePositionAsync(new ClosePositionRequestParameters
+                {
+                    Position = position,
+                    Quantity = quantity,
+                    CloseReason = reason
+                });
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[ORDER] ClosePartial failed: {ex.Message}", StrategyLoggingLevel.Error);
+            }
+        }
+
+        private async Task FlattenPositionAsync(string reason)
+        {
+            // Cancel all working orders first
+            await CancelAllWorkingOrdersAsync();
+
+            var position = FindOpenPosition();
+            if (position == null)
+            {
+                TransitionState(TradeState.Flat, reason);
+                return;
+            }
+
+            try
+            {
+                await Core.Instance.ClosePositionAsync(new ClosePositionRequestParameters
+                {
+                    Position    = position,
+                    CloseReason = reason
+                });
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[ORDER] FlattenPosition failed: {ex.Message}", StrategyLoggingLevel.Error);
+            }
+        }
+
+        private async Task CancelAllWorkingOrdersAsync()
+        {
+            var workingOrders = Core.Instance.Orders
+                .Where(o => o.Account?.Name.Contains(AccountNameFilter,
+                                StringComparison.OrdinalIgnoreCase) == true &&
+                            o.Status == OrderStatus.Working)
+                .ToList();
+
+            foreach (var order in workingOrders)
+            {
+                try { await Core.Instance.CancelOrderAsync(order); }
+                catch { }
+            }
+        }
+
+        private async Task EmergencyHaltAsync(string reason)
+        {
+            QueueLog($"[COMPLIANCE] EMERGENCY HALT | Reason={reason} | " +
+                     $"Equity={_compliance.CurrentBuffer + _compliance.DrawdownFloor:F2} | " +
+                     $"Floor={_compliance.DrawdownFloor:F2} | Buffer={_compliance.CurrentBuffer:F2} | " +
+                     "Action=HALT/FLATTEN", StrategyLoggingLevel.Error);
+
+            await FlattenPositionAsync("EmergencyHalt");
+            TransitionState(TradeState.Halted, reason);
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // ORDER & POSITION EVENT HANDLERS
+        // ═════════════════════════════════════════════════════════════
+
+        protected override void OnOrderChanged(Order order)
+        {
+            base.OnOrderChanged(order);
+
+            if (order.Status == OrderStatus.Filled && order == _entryOrder)
+            {
+                _actualEntryPrice = order.AverageFilledPrice;
+                _entryFilledTime  = DateTime.UtcNow;
+                _breakevenMoved   = false;
+                _tp1Hit           = false;
+                _trailingStopPrice = 0;
+                _dailyTradeCount++;
+
+                // Verify stop loss is working
+                if (_stopOrder?.Status != OrderStatus.Working)
+                {
+                    QueueLog("[RISK] CRITICAL: Stop loss order NOT working after fill! " +
+                             "Manual intervention required.", StrategyLoggingLevel.Error);
+                }
+
+                TransitionState(TradeState.InTrade, $"Entry filled @ {_actualEntryPrice:F1}");
+                QueueLog($"[TRADE] Position opened | Entry={_actualEntryPrice:F1} | " +
+                         $"SL={_activeSignal?.StopPrice:F1} | TP1={_activeSignal?.TP1Price:F1}",
+                         StrategyLoggingLevel.Trading);
+            }
+            else if (order.Status == OrderStatus.Cancelled && order == _entryOrder)
+            {
+                QueueLog("[ORDER] Entry order cancelled.", StrategyLoggingLevel.Info);
+                _entryOrder   = null;
+                _activeSignal = null;
+                TransitionState(TradeState.Scanning, "Entry order cancelled");
+            }
+            else if (order.Status == OrderStatus.Filled && order == _stopOrder)
+            {
+                double exitPrice = order.AverageFilledPrice;
+                double ticks = _setupDirection == SignalDirection.Long
+                    ? (_actualEntryPrice - exitPrice) / _tickSize
+                    : (exitPrice - _actualEntryPrice) / _tickSize;
+                double pnl = ticks * _tickValue * _entryQuantity * -1;
+
+                LogExitEvent("StopLoss", exitPrice, ticks, pnl);
+                _stopOrder    = null;
+                _activeSignal = null;
+                TransitionState(TradeState.Flat, "Stop loss filled");
+            }
+            else if (order.Status == OrderStatus.Rejected)
+            {
+                QueueLog($"[ORDER] Rejected: {order.Comment} | Reason: {order.LastUpdateMessage}",
+                         StrategyLoggingLevel.Error);
+            }
+        }
+
+        protected override void OnPositionChanged(Position position)
+        {
+            base.OnPositionChanged(position);
+            if (TradingSymbol == null || position.Symbol != TradingSymbol) return;
+
+            _sessionUnrealizedPnL = position.GrossPnl;
+
+            if (position.Quantity == 0 && _state == TradeState.InTrade)
+            {
+                // Position fully closed
+                _sessionRealizedPnL += position.GrossPnl;
+                TransitionState(TradeState.Flat, "Position fully closed");
+                _activeSignal = null;
+                _stopOrder    = null;
+                _entryOrder   = null;
+            }
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // COMPLIANCE HELPERS
+        // ═════════════════════════════════════════════════════════════
+
+        private void LoadComplianceConfig()
+        {
+            LucidConfig cfg;
+            try
+            {
+                cfg = File.Exists(LucidRulesPath)
+                    ? LucidConfig.LoadFromFile(LucidRulesPath)
+                    : new LucidConfig();   // fallback to defaults
+                QueueLog($"[CONFIG] Loaded lucid_rules.json from {LucidRulesPath}",
+                         StrategyLoggingLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                QueueLog($"[CONFIG] WARNING: Could not load lucid_rules.json ({ex.Message}). " +
+                         "Using default values. Verify before live trading.",
+                         StrategyLoggingLevel.Error);
+                cfg = new LucidConfig();
+            }
+
+            var account = FindLucidAccount();
+            decimal initialEquity = account != null ? (decimal)account.Equity : cfg.AccountSize;
+
+            _compliance = new LucidComplianceGuard(cfg, initialEquity,
+                (msg, level) => QueueLog(msg,
+                    level == "Error" ? StrategyLoggingLevel.Error : StrategyLoggingLevel.Info));
+
+            if (File.Exists(NewsEventsPath))
+            {
+                _compliance.LoadNewsEvents(NewsEventsPath);
+                QueueLog($"[CONFIG] Loaded news events from {NewsEventsPath}", StrategyLoggingLevel.Info);
+            }
+
+            if (TradingSymbol?.ExpirationDate != null)
+                _compliance.SetContractExpiration(TradingSymbol.ExpirationDate.Value);
+        }
+
+        private void CheckExpirationOnStartup()
+        {
+            if (TradingSymbol?.ExpirationDate == null) return;
+            _compliance.SetContractExpiration(TradingSymbol.ExpirationDate.Value);
+            _compliance.CheckExpiration(DateTime.UtcNow);
+        }
+
+        private void CheckDailySessionReset()
+        {
+            var etNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET);
+            if (etNow.Hour == 17 && etNow.Minute == 0)
+            {
+                _dailyTradeCount      = 0;
+                _sessionRealizedPnL   = 0;
+                _sessionUnrealizedPnL = 0;
+            }
+        }
+
+        private void CheckDailyReset_Halt()
+        {
+            // Allow restart after daily reset (5 PM ET)
+            if (!_compliance.IsEmergencyHalt)
+                TransitionState(TradeState.Scanning, "Daily reset — restarting from HALTED");
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // SetupContext builder
+        // ─────────────────────────────────────────────────────────────
+
+        private SetupContext BuildSetupContext(double mid, string kz, MarketBias bias, SignalDirection dir)
+        {
+            var ms = _msEngine5M.GetLatestStructureEvent();
+            var fvg = _fvgEngine.GetNearestFVG(mid, dir);
+            var ob  = _obEngine.GetNearestOrderBlock(mid, dir);
+            var fpSig = _fpEngine.GetSignalSummary();
+
+            double entryZoneTop = 0, entryZoneBottom = 0;
+            if (fvg != null)
+            {
+                entryZoneTop    = fvg.Top;
+                entryZoneBottom = fvg.Bottom;
+            }
+            else if (ob != null)
+            {
+                entryZoneTop    = ob.Top;
+                entryZoneBottom = ob.Bottom;
+            }
+
+            return new SetupContext
+            {
+                Time                 = DateTime.UtcNow,
+                Symbol               = TradingSymbol?.Name ?? "MGC",
+                ProposedDirection    = dir,
+                HTFBias              = bias,
+                ActiveKillZone       = kz,
+                IsSilverBullet       = _kzEngine.IsSilverBullet(DateTime.UtcNow),
+                LatestStructureEvent = ms,
+                NearestFVG           = fvg,
+                NearestOrderBlock    = ob,
+                HasStackedImbalance  = dir == SignalDirection.Long
+                                       ? fpSig.HasStackedBullishImbalance
+                                       : fpSig.HasStackedBearishImbalance,
+                HasAbsorption        = dir == SignalDirection.Long
+                                       ? fpSig.HasBullishAbsorption
+                                       : fpSig.HasBearishAbsorption,
+                HasDeltaFlip         = false,
+                DOMAbsorptionActive  = _domEngine.IsAbsorptionActive(),
+                DOMStackingActive    = _domEngine.IsStackingActive(),
+                DOMImbalance         = _domEngine.GetImbalanceSignal(),
+                DeltaSlope           = _deltaEngine.GetDeltaSlope(),
+                IsDeltaDivergent     = _deltaEngine.IsDeltaDivergent(dir),
+                IsLargeBlockBurst    = _tapeEngine.IsLargeBlockBurst(dir),
+                IsTapeAccelerating   = _tapeEngine.IsAccelerating(dir),
+                ATR20                = _msEngine5M.GetATR20(),
+                SwingHigh            = _msEngine5M.GetSwingHigh(),
+                SwingLow             = _msEngine5M.GetSwingLow(),
+                EntryZoneTop         = entryZoneTop,
+                EntryZoneBottom      = entryZoneBottom,
+                SignalScore          = 0   // filled after scoring
+            };
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Helpers
+        // ─────────────────────────────────────────────────────────────
+
+        private Account? FindLucidAccount()
+            => Core.Instance.Accounts.FirstOrDefault(a =>
+                a.Name.Contains(AccountNameFilter, StringComparison.OrdinalIgnoreCase));
+
+        private Position? FindOpenPosition()
+            => Core.Instance.Positions.FirstOrDefault(p =>
+                p.Symbol == TradingSymbol &&
+                p.Account?.Name.Contains(AccountNameFilter, StringComparison.OrdinalIgnoreCase) == true);
+
+        private void TransitionState(TradeState newState, string reason)
+        {
+            TradeState oldState;
+            lock (_stateLock)
+            {
+                oldState = _state;
+                _state   = newState;
+            }
+            if (oldState != newState)
+                QueueLog($"[STATE] {oldState} → {newState} | Reason: {reason} | " +
+                         $"Time: {TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ET):HH:mm:ss} ET",
+                         StrategyLoggingLevel.Info);
+        }
+
+        private void LogExitEvent(string reason, double exitPrice, double ticks, double pnl)
+        {
+            TimeSpan duration = DateTime.UtcNow - _entryFilledTime;
+            double rrAchieved = _activeSignal != null
+                ? Math.Abs(ticks) / Math.Abs((_activeSignal.StopPrice - _actualEntryPrice) / _tickSize)
+                : 0;
+
+            QueueLog($"[EXIT] Reason={reason} | Entry={_actualEntryPrice:F1} | Exit={exitPrice:F1} | " +
+                     $"Ticks={ticks:F0} | PnL=${pnl:F2} | Duration={duration.TotalMinutes:F0}min | " +
+                     $"RR_Achieved={rrAchieved:F2}",
+                     StrategyLoggingLevel.Trading);
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // HEARTBEAT LOOP (every 5 minutes)
+        // ═════════════════════════════════════════════════════════════
+
+        private async Task HeartbeatLoopAsync()
+        {
+            while (_state != TradeState.Halted)
+            {
+                await Task.Delay(TimeSpan.FromMinutes(5));
+
+                if ((DateTime.UtcNow - _lastHeartbeatTime) >= TimeSpan.FromMinutes(5))
+                {
+                    _lastHeartbeatTime = DateTime.UtcNow;
+                    float score;
+                    lock (_stateLock) score = 0; // quick read
+
+                    QueueLog($"[HEARTBEAT] State={_state} | " +
+                             $"Delta={_deltaEngine.GetCumulativeDelta()} | " +
+                             $"DailyPnL=${_sessionRealizedPnL + _sessionUnrealizedPnL:F2} | " +
+                             $"Equity=${_compliance.DrawdownFloor + _compliance.CurrentBuffer:F2} | " +
+                             $"DD_Buffer=${_compliance.CurrentBuffer:F2} | " +
+                             $"DailyTrades={_dailyTradeCount}",
+                             StrategyLoggingLevel.Info);
+
+                    // Reload compliance config periodically
+                    try { LoadComplianceConfig(); } catch { }
+
+                    // Expiration check
+                    if (TradingSymbol?.ExpirationDate != null)
+                        _compliance.CheckExpiration(DateTime.UtcNow);
+                }
+            }
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // LOCK-FREE LOG THREAD
+        // ═════════════════════════════════════════════════════════════
+
+        private void QueueLog(string msg, StrategyLoggingLevel level)
+        {
+            _logQueue.Enqueue((msg, level));
+        }
+
+        private void LogThreadProc()
+        {
+            while (_logRunning || !_logQueue.IsEmpty)
+            {
+                if (_logQueue.TryDequeue(out var entry))
+                {
+                    try
+                    {
+                        bool shouldLog = entry.Level != StrategyLoggingLevel.Debug || EnableDebugLog;
+                        if (shouldLog)
+                            Log(entry.Msg, entry.Level);
+                    }
+                    catch { }
+                }
+                else
+                {
+                    Thread.Sleep(1);
+                }
+            }
+        }
+
+        private void FlushLogQueue()
+        {
+            while (_logQueue.TryDequeue(out var entry))
+            {
+                try
+                {
+                    bool shouldLog = entry.Level != StrategyLoggingLevel.Debug || EnableDebugLog;
+                    if (shouldLog) Log(entry.Msg, entry.Level);
+                }
+                catch { }
+            }
+        }
+    }
+}
