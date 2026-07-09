@@ -182,7 +182,7 @@ namespace LucidGold.Core.RiskManagement
         {
             if (!_config.WeekendFlatRequired) return false;
             var etNow = TimeZoneInfo.ConvertTimeFromUtc(utcNow, ET);
-            if (etNow.DayOfWeek == DayOfWeek.Friday && etNow.Hour >= 16 && etNow.Minute >= 45)
+            if (etNow.DayOfWeek == DayOfWeek.Friday && (etNow.Hour > 16 || (etNow.Hour == 16 && etNow.Minute >= 45)))
             {
                 _log($"[COMPLIANCE] Guard=WeekendFlat | Time={etNow:HH:mm} ET | Action=FLATTEN", "Info");
                 return true;
