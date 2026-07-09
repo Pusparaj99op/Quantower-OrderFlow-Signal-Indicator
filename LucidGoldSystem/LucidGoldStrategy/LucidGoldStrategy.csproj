@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <TargetFramework>net6.0-windows</TargetFramework>
+    <NoWarn>1705;1591</NoWarn>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <AssemblyName>LucidGoldStrategy</AssemblyName>
@@ -20,7 +21,7 @@
   <ItemGroup>
     <!-- Local SDK reference — verify path matches your Quantower installation -->
     <Reference Include="TradingPlatform.BusinessLayer">
-      <HintPath>C:\Quantower\TradingPlatform\v1.146.14\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <HintPath>C:\Quantower\bin\TradingPlatform.BusinessLayer.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
