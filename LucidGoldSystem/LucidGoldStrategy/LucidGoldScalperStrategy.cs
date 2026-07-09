@@ -194,6 +194,8 @@ namespace LucidGold.Strategy
         private double _sessionRealizedPnL;
         private double _sessionUnrealizedPnL;
         private DateTime _lastHeartbeatTime = DateTime.MinValue;
+        private DateTime _lastBarTime5M  = DateTime.MinValue;
+        private DateTime _lastHtfRefresh = DateTime.MinValue;
         private static readonly TimeZoneInfo ET =
             TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
@@ -291,12 +293,7 @@ namespace LucidGold.Strategy
             TradingSymbol.NewLevel2   += Symbol_NewLevel2;
             TradingSymbol.NewQuote    += Symbol_NewQuote;
 
-            // BUG 11 FIX: Subscribe to bar close events via HistoricalData.NewHistoryItem
-            // This replaces the incorrect quote-throttle approach (ProcessBarFromQuoteAsync).
-            _barData5M  = TradingSymbol.GetHistory(Period.MIN5,  DateTime.UtcNow.AddDays(-5),  DateTime.UtcNow);
-            _barData15M = TradingSymbol.GetHistory(Period.MIN15, DateTime.UtcNow.AddDays(-5),  DateTime.UtcNow);
-            if (_barData5M  != null) _barData5M.NewHistoryItem  += On5MBarClosed;
-            if (_barData15M != null) _barData15M.NewHistoryItem += On15MBarClosed;
+
 
             // Verify contract expiration
             CheckExpirationOnStartup();
@@ -323,9 +320,8 @@ namespace LucidGold.Strategy
                 TradingSymbol.NewQuote  -= Symbol_NewQuote;
             }
 
-            // BUG 11 FIX: Unsubscribe bar data events
-            if (_barData5M  != null) _barData5M.NewHistoryItem  -= On5MBarClosed;
-            if (_barData15M != null) _barData15M.NewHistoryItem -= On15MBarClosed;
+            var pos = FindOpenPosition();
+            if (pos != null) pos.Updated -= OnPositionUpdated;
 
             // Stop log thread
             _logRunning = false;
@@ -358,6 +354,17 @@ namespace LucidGold.Strategy
 
             if (LogTickData)
                 QueueLog($"[TICK] {last.Price:F1} x{last.Size} {side}", StrategyLoggingLevel.Info);
+
+            // Bar transition detection (5-minute boundary)
+            DateTime barBoundary = new DateTime(
+                last.Time.Year, last.Time.Month, last.Time.Day,
+                last.Time.Hour, (last.Time.Minute / 5) * 5, 0, DateTimeKind.Utc);
+
+            if (barBoundary > _lastBarTime5M)
+            {
+                _lastBarTime5M = barBoundary;
+                Task.Run(() => ProcessBarsOnNewBar(sym));
+            }
         }
 
         // ═════════════════════════════════════════════════════════════
@@ -384,98 +391,51 @@ namespace LucidGold.Strategy
         // (BUG 11 FIX: replaces incorrect quote-based throttle approach)
         // ─────────────────────────────────────────────────────────────
 
-        // BUG 11 FIX: HistoricalData subscriptions for proper bar-close detection
-        private HistoricalData? _barData5M;
-        private HistoricalData? _barData15M;
-
-        private void On5MBarClosed(object? sender, HistoryEventArgs args)
-        {
-            if (args.HistoryItem is HistoryItemBar bar)
-                Task.Run(() => ProcessBarAsync(TradingSymbol!, Period.MIN5, bar));
-        }
-
-        private void On15MBarClosed(object? sender, HistoryEventArgs args)
-        {
-            if (args.HistoryItem is HistoryItemBar bar)
-                Task.Run(() => ProcessBarAsync(TradingSymbol!, Period.MIN15, bar));
-        }
-
-        private void ProcessBarAsync(Symbol sym, Period period, HistoryItemBar bar)
+        private void ProcessBarsOnNewBar(Symbol sym)
         {
             try
             {
-                var coreBar = new CoreBar
+                var bars5M = FetchBars(sym.Name, Period.MIN5, 30).ToList();
+                if (bars5M.Count >= 3)
                 {
-                    Time   = bar.TimeLeft,
-                    Open   = bar.Open,
-                    High   = bar.High,
-                    Low    = bar.Low,
-                    Close  = bar.Close,
-                    Volume = (long)bar.Volume  // SDK: HistoryItemBar.Volume is double; CoreBar.Volume is long
-                };
-
-                // 5-minute bars drive primary structure
-                if (period == Period.MIN5)
-                {
-                    _msEngine5M.ProcessNewBar(coreBar, "5M");
-                    _fvgEngine.ProcessNewBar(
-                        PriorBar(1, coreBar), PriorBar(0, coreBar), coreBar, "5M");
-                }
-                else if (period == Period.MIN15)
-                {
-                    _msEngine15M.ProcessNewBar(coreBar, "15M");
+                    var b0 = bars5M[^1];
+                    var b1 = bars5M[^2];
+                    var b2 = bars5M[^3];
+                    _msEngine5M.ProcessNewBar(b1, "5M");
+                    _fvgEngine.ProcessNewBar(b2, b1, b0, "5M");
+                    _fpEngine.OnBarClose(b0.High, b0.Low, b0.Close, b0.Time);
+                    _deltaEngine.OnBarClose(b0.High, b0.Low);
+                    _obEngine.ProcessBars(bars5M, _msEngine5M.GetATR20(), _tickSize);
+                    _fvgEngine.UpdateFillStatus(b0.Close, _tickSize);
                 }
 
-                _fpEngine.OnBarClose(bar.High, bar.Low, bar.Close, bar.TimeLeft);
-                _deltaEngine.OnBarClose(bar.High, bar.Low);
+                var bars15M = FetchBars(sym.Name, Period.MIN15, 10).ToList();
+                if (bars15M.Count > 0)
+                    _msEngine15M.ProcessNewBar(bars15M[^1], "15M");
+
                 _domEngine.EvaluateConditions();
-                // BUG 11 FIX: bar.TimeLeft is already UTC; SpecifyKind prevents double-conversion
-                _vpEngine.CheckSessionReset(DateTime.SpecifyKind(bar.TimeLeft, DateTimeKind.Utc));
-
-                // Check daily session reset
+                _vpEngine.CheckSessionReset(DateTime.UtcNow);
                 CheckDailySessionReset();
 
-                // Periodic HTF bias refresh
-                Task.Run(() => RefreshHTFBias(sym.Name));
+                if ((DateTime.UtcNow - _lastHtfRefresh).TotalMinutes >= 15)
+                {
+                    _lastHtfRefresh = DateTime.UtcNow;
+                    RefreshHTFBias(sym.Name);
+                }
             }
             catch (Exception ex)
             {
-                QueueLog($"[ERROR] ProcessBarAsync: {ex.Message}", StrategyLoggingLevel.Error);
+                QueueLog($"[ERROR] ProcessBarsOnNewBar: {ex.Message}", StrategyLoggingLevel.Error);
             }
         }
 
-        // Simple prior bar cache (last 3 bars for FVG)
-        private readonly CoreBar?[] _priorBarCache = new CoreBar?[3];
-        private int _priorBarIdx = 0;
-
-        private CoreBar PriorBar(int offset, CoreBar current)
-        {
-            _priorBarCache[_priorBarIdx % 3] = current;
-            _priorBarIdx++;
-            int target = _priorBarIdx - 1 - offset;
-            if (target < 0) return current;
-            return _priorBarCache[target % 3] ?? current;
-        }
-
-        // BUG 8 FIX: Replaced FetchBarsAsync (used non-existent SimpleAggregation +
-        // Core.Instance.GetHistoryAsync) with synchronous Symbol.GetHistory().
-        // Also fixed: new Period(PeriodType.Hour, 4) → Period.HOUR4 (SDK constant).
         private void RefreshHTFBias(string symbolName)
         {
             try
             {
-                var sym = TradingPlatform.BusinessLayer.Core.Instance.Symbols
-                              .FirstOrDefault(s => s.Name == symbolName);
-                if (sym == null) return;
-
-                var from    = DateTime.UtcNow.AddDays(-60);
-                var to      = DateTime.UtcNow;
-                var dailyHD = sym.GetHistory(Period.DAY1,  from, to);
-                var h4HD    = sym.GetHistory(Period.HOUR4, from, to);
-
-                var dailyBars = ConvertHistoricalData(dailyHD);
-                var h4Bars    = ConvertHistoricalData(h4HD);
-                _htfEngine.Refresh(dailyBars, h4Bars);
+                var daily = FetchBars(symbolName, Period.DAY1, 50);
+                var h4    = FetchBars(symbolName, new Period(PeriodType.Hour, 4), 50);
+                _htfEngine.Refresh(daily, h4);
             }
             catch (Exception ex)
             {
@@ -483,36 +443,27 @@ namespace LucidGold.Strategy
             }
         }
 
-        private IEnumerable<CoreBar> FetchBars(string symbolName, Period period, int barsCount)
+        private IEnumerable<CoreBar> FetchBars(string symbolName, Period period, int count)
         {
             try
             {
-                var sym = TradingPlatform.BusinessLayer.Core.Instance.Symbols
-                              .FirstOrDefault(s => s.Name == symbolName);
+                var sym = TradingPlatform.BusinessLayer.Core.Instance.Symbols.FirstOrDefault(s => s.Name == symbolName);
                 if (sym == null) return Enumerable.Empty<CoreBar>();
 
-                var from = DateTime.UtcNow.AddDays(-barsCount);
-                var to   = DateTime.UtcNow;
-                var hd   = sym.GetHistory(period, from, to);
-                return ConvertHistoricalData(hd);
+                var history = sym.GetHistory(period, DateTime.UtcNow.AddDays(-count));
+                if (history == null) return Enumerable.Empty<CoreBar>();
+
+                return history.Select(item =>
+                {
+                    if (item is HistoryItemBar b)
+                        return new CoreBar { Time=item.TimeLeft, Open=b.Open,
+                                             High=b.High, Low=b.Low,
+                                             Close=b.Close, Volume=(long)b.Volume };
+                    double p = item[PriceType.Close];
+                    return new CoreBar { Time=item.TimeLeft, Open=p, High=p, Low=p, Close=p };
+                }).ToList();
             }
             catch { return Enumerable.Empty<CoreBar>(); }
-        }
-
-        private static IEnumerable<CoreBar> ConvertHistoricalData(HistoricalData? hd)
-        {
-            if (hd == null) return Enumerable.Empty<CoreBar>();
-            var result = new List<CoreBar>(hd.Count);
-            for (int i = 0; i < hd.Count; i++)
-            {
-                var item = hd[i];
-                if (item is HistoryItemBar b)
-                    result.Add(new CoreBar { Time = b.TimeLeft, Open = b.Open,
-                                            High = b.High, Low = b.Low,
-                                            Close = b.Close,
-                                            Volume = (long)b.Volume }); // b.Volume is double
-            }
-            return result;
         }
 
         // ═════════════════════════════════════════════════════════════
@@ -522,14 +473,14 @@ namespace LucidGold.Strategy
         private void Symbol_NewQuote(Symbol sym, Quote quote)
         {
             // Dispatch to background — do not run state machine on platform event thread
-            Task.Run(() => EvaluateStateMachineAsync(sym, quote));
+            Task.Run(() => EvaluateStateMachine(sym, quote));
         }
 
         // ═════════════════════════════════════════════════════════════
         // STATE MACHINE EVALUATION
         // ═════════════════════════════════════════════════════════════
 
-        private async Task EvaluateStateMachineAsync(Symbol sym, Quote quote)
+        private void EvaluateStateMachine(Symbol sym, Quote quote)
         {
             try
             {
@@ -584,11 +535,11 @@ namespace LucidGold.Strategy
                         break;
 
                     case TradeState.Scanning:
-                        await EvaluateScanningAsync(mid);
+                        EvaluateScanning(mid);
                         break;
 
                     case TradeState.SetupIdentified:
-                        await EvaluateSetupIdentifiedAsync(mid);
+                        EvaluateSetupIdentified(mid);
                         break;
 
                     case TradeState.AwaitingConfirmation:
@@ -601,7 +552,7 @@ namespace LucidGold.Strategy
 
                     case TradeState.InTrade:
                     case TradeState.Managing:
-                        await EvaluatePositionManagementAsync(mid, bid, ask);
+                        EvaluatePositionManagement(mid, bid, ask);
                         break;
                 }
             }
@@ -628,7 +579,7 @@ namespace LucidGold.Strategy
         // State: SCANNING
         // ─────────────────────────────────────────────────────────────
 
-        private async Task EvaluateScanningAsync(double mid)
+        private void EvaluateScanning(double mid)
         {
             // Exit scanning if kill zone ends
             string kz = _kzEngine.GetActiveKillZoneName(DateTime.UtcNow,
@@ -698,7 +649,7 @@ namespace LucidGold.Strategy
         // State: SETUP_IDENTIFIED
         // ─────────────────────────────────────────────────────────────
 
-        private async Task EvaluateSetupIdentifiedAsync(double mid)
+        private void EvaluateSetupIdentified(double mid)
         {
             if (_activeSignal == null) { TransitionState(TradeState.Scanning, "Signal lost"); return; }
 
@@ -825,7 +776,7 @@ namespace LucidGold.Strategy
         // State: IN_TRADE / MANAGING
         // ─────────────────────────────────────────────────────────────
 
-        private async Task EvaluatePositionManagementAsync(double mid, double bid, double ask)
+        private void EvaluatePositionManagement(double mid, double bid, double ask)
         {
             if (_activeSignal == null) return;
 
@@ -836,8 +787,7 @@ namespace LucidGold.Strategy
                 return;
             }
 
-            // BUG 10 FIX: Position.GrossPnL (capital L). .Value because PnlValue wraps nullable double.
-            double unrealizedPnL = position.GrossPnL.Value;
+            double unrealizedPnL = position.GrossPnl;
             _sessionUnrealizedPnL = unrealizedPnL;
 
             double ticksProfit = _setupDirection == SignalDirection.Long
@@ -1062,10 +1012,15 @@ namespace LucidGold.Strategy
             if (position == null) return;
             try
             {
-                // Note: ClosePositionRequestParameters in this SDK version does not support
-                // Quantity directly. Close entire position; strategy tracks TP1 state.
-                TradingPlatform.BusinessLayer.Core.Instance.ClosePosition(
-                    new ClosePositionRequestParameters { Position = position });
+                TradingPlatform.BusinessLayer.Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+                {
+                    Symbol      = TradingSymbol!,
+                    Account     = position.Account,
+                    Side        = position.Side == Side.Buy ? Side.Sell : Side.Buy,
+                    OrderTypeId = OrderType.Market,
+                    Quantity    = quantity,
+                    Comment     = reason
+                });
             }
             catch (Exception ex)
             {
@@ -1088,8 +1043,7 @@ namespace LucidGold.Strategy
 
             try
             {
-                TradingPlatform.BusinessLayer.Core.Instance.ClosePosition(
-                    new ClosePositionRequestParameters { Position = position });
+                position.Close();
             }
             catch (Exception ex)
             {
@@ -1104,7 +1058,7 @@ namespace LucidGold.Strategy
             var workingOrders = TradingPlatform.BusinessLayer.Core.Instance.Orders
                 .Where(o => o.Account?.Name.Contains(AccountNameFilter,
                                 StringComparison.OrdinalIgnoreCase) == true &&
-                            o.Status == OrderStatus.Opened)
+                            o.Status == OrderStatus.Working)
                 .ToList();
 
             foreach (var order in workingOrders)
@@ -1147,7 +1101,7 @@ namespace LucidGold.Strategy
                 _dailyTradeCount++;
 
                 // Verify stop loss is working
-                if (_stopOrder?.Status != OrderStatus.Opened)
+                if (_stopOrder?.Status != OrderStatus.Working)
                 {
                     QueueLog("[RISK] CRITICAL: Stop loss order NOT working after fill! " +
                              "Manual intervention required.", StrategyLoggingLevel.Error);
@@ -1198,14 +1152,12 @@ namespace LucidGold.Strategy
         {
             if (TradingSymbol == null || position.Symbol != TradingSymbol) return;
 
-            // BUG 10 FIX: Position.GrossPnL (capital L) — standardize capitalization.
-            // .Value because PnlValue is a struct wrapping nullable double.
-            _sessionUnrealizedPnL = position.GrossPnL.Value;
+            _sessionUnrealizedPnL = position.GrossPnl;
 
             if (position.Quantity == 0 && _state == TradeState.InTrade)
             {
                 // Position fully closed
-                _sessionRealizedPnL += position.GrossPnL.Value;
+                _sessionRealizedPnL += position.GrossPnl;
                 TransitionState(TradeState.Flat, "Position fully closed");
                 _activeSignal = null;
                 _stopOrder    = null;
