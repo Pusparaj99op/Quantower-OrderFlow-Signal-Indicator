@@ -117,6 +117,7 @@ namespace LucidGold.Indicator
         private double _pdHigh     = 0;
         private double _pdLow      = double.MaxValue;
         private DateTime _prevDate = DateTime.MinValue;
+        private DateTime _lastHtfRefresh = DateTime.MinValue;
 
         // Signal score for badge
         private float  _currentScore     = 0;
@@ -144,9 +145,7 @@ namespace LucidGold.Indicator
             Description = "ICT/SMC order-flow signal indicator for MGC/GC. Display only.";
             SeparateWindow = false;
 
-            // Delta sub-pane
-            AddLineSeries("BarDelta",  Color.DarkGreen, 2, LineStyle.Histogramm);
-            AddLineSeries("CumDelta",  Color.Purple,    1, LineStyle.Solid);
+
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -174,14 +173,31 @@ namespace LucidGold.Indicator
             _vpEngine    = new VolumeProfileEngine(_tickSize);
             _scoreEngine = new SignalScoringEngine();
 
-            _barDeltaSeriesIdx = 0;
-            _cumDeltaSeriesIdx = 1;
+
 
             // Subscribe to real-time data events (Indicator has no OnNewTrade/OnNewLevel2 overrides)
             if (Symbol != null)
             {
                 Symbol.NewLast   += HandleNewLast;
                 Symbol.NewLevel2 += HandleNewLevel2;
+
+                try
+                {
+                    var dailyHist = Symbol.GetHistory(Period.DAY1, DateTime.UtcNow.AddDays(-60));
+                    var h4Hist    = Symbol.GetHistory(new Period(PeriodType.Hour, 4), DateTime.UtcNow.AddDays(-20));
+
+                    IEnumerable<CoreBar> ToCoreBars(HistoricalData hd) =>
+                        hd?.Select(item => item is HistoryItemBar b
+                            ? new CoreBar { Time=item.TimeLeft, Open=b.Open, High=b.High,
+                                            Low=b.Low, Close=b.Close, Volume=(long)b.Volume }
+                            : new CoreBar { Time=item.TimeLeft, Open=item[PriceType.Close],
+                                            High=item[PriceType.Close], Low=item[PriceType.Close],
+                                            Close=item[PriceType.Close] })
+                        ?? Enumerable.Empty<CoreBar>();
+
+                    _htfEngine.Refresh(ToCoreBars(dailyHist), ToCoreBars(h4Hist));
+                }
+                catch { /* stay neutral */ }
             }
         }
 
@@ -207,14 +223,7 @@ namespace LucidGold.Indicator
                 // VWAP rendered in OnPaintChart; no series needed for main pane
             }
 
-            // Update delta sub-pane lines
-            if (ShowDeltaPane && _barDeltaSeriesIdx >= 0)
-            {
-                double barDelta = _deltaEngine.GetBarDelta();
-                double cumDelta = _deltaEngine.GetCumulativeDelta();
-                SetValue(barDelta, _barDeltaSeriesIdx);
-                SetValue(cumDelta, _cumDeltaSeriesIdx);
-            }
+
         }
 
         private void ProcessBarClose(UpdateArgs args)
@@ -225,7 +234,7 @@ namespace LucidGold.Indicator
 
             var bar0 = ToBar(HistoricalData[1]);  // just closed
             var bar1 = ToBar(HistoricalData[2]);
-            var bar2 = HistoricalData.Count > 3 ? ToBar(HistoricalData[3]) : bar1;
+            var bar2 = ToBar(HistoricalData[3]);
 
             string tf = HistoricalData.Aggregation?.ToString() ?? "1M";
 
@@ -250,9 +259,27 @@ namespace LucidGold.Indicator
             // VWAP session check
             CheckVwapSessionReset(bar0.Time);
 
-            // HTF bias refresh (throttled internally to 15-minute intervals)
-            // In indicator context we just call with empty lists if no data; real callers inject daily/4H bars
-            _htfEngine.Refresh(Enumerable.Empty<CoreBar>(), Enumerable.Empty<CoreBar>());
+            if ((DateTime.UtcNow - _lastHtfRefresh).TotalMinutes >= 15)
+            {
+                _lastHtfRefresh = DateTime.UtcNow;
+                try
+                {
+                    var dailyHist = Symbol.GetHistory(Period.DAY1, DateTime.UtcNow.AddDays(-60));
+                    var h4Hist    = Symbol.GetHistory(new Period(PeriodType.Hour, 4), DateTime.UtcNow.AddDays(-20));
+
+                    IEnumerable<CoreBar> ToCoreBars(HistoricalData hd) =>
+                        hd?.Select(item => item is HistoryItemBar b
+                            ? new CoreBar { Time=item.TimeLeft, Open=b.Open, High=b.High,
+                                            Low=b.Low, Close=b.Close, Volume=(long)b.Volume }
+                            : new CoreBar { Time=item.TimeLeft, Open=item[PriceType.Close],
+                                            High=item[PriceType.Close], Low=item[PriceType.Close],
+                                            Close=item[PriceType.Close] })
+                        ?? Enumerable.Empty<CoreBar>();
+
+                    _htfEngine.Refresh(ToCoreBars(dailyHist), ToCoreBars(h4Hist));
+                }
+                catch { /* stay neutral */ }
+            }
 
             _totalBarCount++;
         }
@@ -381,7 +408,11 @@ namespace LucidGold.Indicator
                 int barIdx = HistoricalData.Count - 1;
                 bool alreadyMarked = _arrows.Any(a => a.BarIndex == barIdx);
                 if (!alreadyMarked)
-                    _arrows.Add((barIdx, HistoricalData[0][PriceType.Close], dir, score));
+                {
+                    if (_arrows.Count >= 50)
+                        _arrows.RemoveAt(0);
+                    _arrows.Add((barIdx, HistoricalData[1][PriceType.Close], dir, score));
+                }
             }
         }
 
@@ -790,7 +821,7 @@ namespace LucidGold.Indicator
                     High   = b.High,
                     Low    = b.Low,
                     Close  = b.Close,
-                    Volume = b.Ticks
+                    Volume = (long)b.Volume
                 };
 
             double price = item[PriceType.Close];
@@ -847,54 +878,7 @@ namespace LucidGold.Indicator
         // IChart.BarsWidth: bar pixel width
         // ─────────────────────────────────────────────────────────────
 
-        // BUG 2 FIX: Was using non-existent base.ChartWindow?.GetXByBarNumber/etc.
-        // Correct API: CurrentChart.MainWindow.CoordinatesConverter.GetChartX/GetChartY
 
-        private float GetXByBarNumber(int barIndex)
-        {
-            try
-            {
-                var chart = this.CurrentChart;
-                if (chart == null) return 0f;
-                // Convert bar index to timestamp, then to screen X
-                var item = HistoricalData[barIndex];
-                return (float)chart.MainWindow.CoordinatesConverter.GetChartX(item.TimeLeft);
-            }
-            catch { return 0f; }
-        }
-
-        private float GetXByTime(DateTime time)
-        {
-            try
-            {
-                var chart = this.CurrentChart;
-                if (chart == null) return 0f;
-                return (float)chart.MainWindow.CoordinatesConverter.GetChartX(time);
-            }
-            catch { return 0f; }
-        }
-
-        private float GetYByValue(double price)
-        {
-            try
-            {
-                var chart = this.CurrentChart;
-                if (chart == null) return 0f;
-                return (float)chart.MainWindow.CoordinatesConverter.GetChartY(price);
-            }
-            catch { return 0f; }
-        }
-
-        private float GetBarWidth()
-        {
-            try
-            {
-                var chart = this.CurrentChart;
-                if (chart == null) return 4f;
-                return (float)chart.BarsWidth;
-            }
-            catch { return 4f; }
-        }
 
         // ─────────────────────────────────────────────────────────────
         // Cleanup
